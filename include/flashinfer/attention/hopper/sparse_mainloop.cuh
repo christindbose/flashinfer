@@ -196,12 +196,21 @@ struct SparseCollectiveMainloop {
                       group_modes<0, 2>(gQ_x));  // (TMA), (TMA)
 
     int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
+    
+    int kv_tile_idx = num_kv_tiles - 1;
+    
+    int kv_tiles_cluster = cute::ceil_div(num_kv_tiles, cluster_size);
+    
+    int kv_start = kv_tiles_cluster * clusterBlockRank;
+    int kv_end = min(kv_start + kv_tiles_cluster - 1, num_kv_tiles - 1);
+
+    kv_tile_idx = kv_end;
 
     //printf("num_kv_tiles: %d\n", num_kv_tiles);
     //int kv_tile_idx = num_kv_tiles - 1;
-    int tiles_per_cluster = num_kv_tiles / cluster_size;
+    //int tiles_per_cluster = num_kv_tiles / cluster_size;
     //int kv_tile_idx = num_kv_tiles - clusterBlockRank - 1;
-    int kv_tile_idx = num_kv_tiles - tiles_per_cluster * clusterBlockRank - 1;
+    //int kv_tile_idx = num_kv_tiles - tiles_per_cluster * clusterBlockRank - 1;
 
 
     /*
@@ -308,7 +317,7 @@ struct SparseCollectiveMainloop {
 
     shared_storage.barrier_O.wait((work_idx + 1) % 2);
 
-    if (kv_tile_idx == swa_begin_kv_tile_idx) {
+    if (kv_tile_idx == swa_begin_kv_tile_idx || kv_tile_idx == kv_start) {
       pipeline_v.producer_acquire(smem_pipe_write_v);
       Tensor tVgViGroup = flatten_1(tVgV(_, _, _, kv_tile_idx));  // (CPY, (CPY_KV, CPY_D))
       Tensor tVsViGroup =
@@ -339,7 +348,7 @@ struct SparseCollectiveMainloop {
 
       // load remaining k/v tiles
 #pragma unroll 2
-      for (; kv_tile_idx > swa_begin_kv_tile_idx;
+      for (; kv_tile_idx > swa_begin_kv_tile_idx && kv_tile_idx > kv_start;
            kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
         pipeline_k.producer_acquire(smem_pipe_write_k);
 
@@ -363,7 +372,7 @@ struct SparseCollectiveMainloop {
       // load first v tile
       {
         pipeline_v.producer_acquire(smem_pipe_write_v);
-        Tensor tVgVi = tVgV(_, _, _, 0);                          // (CPY, (CPY_KV, CPY_D))
+        Tensor tVgVi = tVgV(_, _, _, kv_start);                          // (CPY, (CPY_KV, CPY_D))
         Tensor tVsVi = tVsV(_, _, _, smem_pipe_write_v.index());  // (CPY, (CPY_KV, CPY_D))
         copy(gmem_tiled_copy_v, tVgVi, tVsVi);
         pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);

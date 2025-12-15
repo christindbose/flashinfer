@@ -74,8 +74,19 @@ CUTLASS_DEVICE void mma_f16(
   tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
   int kv_tile_idx = kv_tile_idx_count - 1;
 
+  int kv_tiles_cluster = cute::ceil_div(kv_tile_idx_count, cluster_size);
+  
+  int kv_start = kv_tiles_cluster * clusterBlockRank;
+  int kv_end = min(kv_start + kv_tiles_cluster - 1, kv_tile_idx_count - 1);
+
+  //kv_tile_idx = kv_tiles_cluster - 1;
+
+  kv_tile_idx = kv_end;
+  
   //int effective_kv_tile_count = (kv_tile_idx_count + 1) / 2;
   //kv_tile_idx = effective_kv_tile_count - 1;
+
+  //printf("kv_start: %d, kv_end: %d\n", kv_start, kv_end);
 
 
 
@@ -203,7 +214,7 @@ CUTLASS_DEVICE void mma_f16(
 
 
 #pragma unroll 1
-  for (; kv_tile_idx > swa_end_kv_tile_idx + 1; kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
+  for (; kv_tile_idx > swa_end_kv_tile_idx + 1 && kv_tile_idx > kv_start; kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
     //printf("inn non unroll loop");
     Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
     consumer_wait(pipeline_k, smem_pipe_read_k);
