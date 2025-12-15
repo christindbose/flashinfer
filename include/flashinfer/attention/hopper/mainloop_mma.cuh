@@ -15,6 +15,9 @@
 
 namespace flashinfer {
 
+
+
+
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
           typename WarpScheduler, typename AttentionVariant, typename Params,
           typename MainloopPipeline, typename PipelineState, typename SharedStorage,
@@ -71,15 +74,11 @@ CUTLASS_DEVICE void mma_f16(
   tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
   int kv_tile_idx = kv_tile_idx_count - 1;
 
-  int effective_kv_tile_count = (kv_tile_idx_count + 1) / 2;
-  kv_tile_idx = effective_kv_tile_count - 1;
+  //int effective_kv_tile_count = (kv_tile_idx_count + 1) / 2;
+  //kv_tile_idx = effective_kv_tile_count - 1;
 
 
-  /*
-  if (threadIdx.x == 130) {
-  printf("kv_tile_idx_count: %d\n", kv_tile_idx_count);
-  }
-  */
+
   
   cutlass::ConsumerToken barrier_token =
       static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));
@@ -201,56 +200,7 @@ CUTLASS_DEVICE void mma_f16(
 
   constexpr int n_masking_steps = MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
                                                    : (CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
-  // masking loops
-  // ziangl@nvidia.com: for multi item scoring, we use this loop only to mask along the diagonal
-#pragma unroll
-  for (int masking_step = 0; masking_step < n_masking_steps && kv_tile_idx > swa_begin_kv_tile_idx;
-       ++masking_step, kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
-    printf("masking");
-    Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
-    consumer_wait(pipeline_k, smem_pipe_read_k);
-    WarpScheduler::barrier_sync();
-    gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()),
-                                        tSrS);
-    if (masking_step > 0) {
-      attention_updater.rescale_o(tOrO);
-    }
-    consumer_wait(pipeline_v, smem_pipe_read_v);
-    gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
-                                         tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-    WarpScheduler::barrier_arrive();
-    warpgroup_wait<1>();
-    pipeline_k.consumer_release(smem_pipe_read_k);  // release K
-    Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_QKD{}));
-    Tensor tScS = threadMmaQK.partition_C(cS);
-#pragma unroll
-    for (int i = 0; i < size(tSrS); ++i) {
-      int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
-      int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                        qo_head_idx, kv_head_idx);
-      if (MULTIITEMSCORING) {
-        mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
-      } else {
-        if (kv_idx >= col_limit_right(qo_idx)) {
-          tSrS(i) = AttentionUpdater::fill_value;
-        }
-      }
-      if constexpr (LEFT_SLIDING_WINDOW) {
-        if (kv_idx < col_limit_left(qo_idx)) {
-          tSrS(i) = AttentionUpdater::fill_value;
-        }
-      }
-    }
-    attention_updater.update</*init=*/false>(tSrS);
-    warpgroup_wait<0>();
-    pipeline_v.consumer_release(smem_pipe_read_v);  // release V
-    ++smem_pipe_read_k;
-    ++smem_pipe_read_v;
-    cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                           convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
-               tOrP);
-  }
+
 
 #pragma unroll 1
   for (; kv_tile_idx > swa_end_kv_tile_idx + 1; kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
@@ -302,43 +252,10 @@ CUTLASS_DEVICE void mma_f16(
                tOrP);
   }
 
-  if constexpr (LEFT_SLIDING_WINDOW) {
-#pragma unroll 1
-    for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
-      Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
-      consumer_wait(pipeline_k, smem_pipe_read_k);
-      WarpScheduler::barrier_sync();
-      gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ,
-                                          tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
-      attention_updater.rescale_o(tOrO);
-      consumer_wait(pipeline_v, smem_pipe_read_v);
-      gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
-                                           tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-      WarpScheduler::barrier_arrive();
-      warpgroup_wait<1>();
-      pipeline_k.consumer_release(smem_pipe_read_k);  // release K
-      Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_QKD{}));
-      Tensor tScS = threadMmaQK.partition_C(cS);
-#pragma unroll
-      for (int i = 0; i < size(tSrS); ++i) {
-        int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
-        int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
-        tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                          qo_head_idx, kv_head_idx);
-        if (kv_idx < col_limit_left(qo_idx)) {
-          tSrS(i) = AttentionUpdater::fill_value;
-        }
-      }
-      attention_updater.update</*init=*/false>(tSrS);
-      warpgroup_wait<0>();
-      pipeline_v.consumer_release(smem_pipe_read_v);  // release V
-      ++smem_pipe_read_k;
-      ++smem_pipe_read_v;
-      cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
-                 tOrP);
-    }
-  }
+  
+  //printf("LEFT_SLIDING_WINDOW: %d\n", LEFT_SLIDING_WINDOW);
+  //printf("MULTIITEMSCORING: %d\n", MULTIITEMSCORING);
+
 
   // Tell warp 0 that smem_q is ready
   cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
@@ -357,6 +274,7 @@ CUTLASS_DEVICE void mma_f16(
   attention_updater.rescale_o(tOrO);
   return;
 }
+
 
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
           typename WarpScheduler, typename AttentionVariant, typename Params,
