@@ -230,18 +230,7 @@ CUTLASS_DEVICE void mma_f16(
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
                                         qo_head_idx, kv_head_idx);
     }
-    if constexpr (MULTIITEMSCORING) {
-      // auto nums_tiles_outside_causal_diagonal = kv_tile_idx_count - cute::ceil_div(CTA_Q,
-      // CTA_KV);
-      if (kv_tile_idx >= num_kv_tiles_prefix - 1) {
-#pragma unroll
-        for (int i = 0; i < size(tSrS); ++i) {
-          int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
-          int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
-          mask_multi_item_scoring_assume_in_bound(tSrS, i, qo_idx, kv_idx);
-        }
-      }
-    }
+
     attention_updater.update</*init=*/false>(tSrS);
     warpgroup_wait<0>();
     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
