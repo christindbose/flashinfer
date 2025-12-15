@@ -350,6 +350,12 @@ struct SparseCollectiveMainloop {
 #pragma unroll 2
       for (; kv_tile_idx > swa_begin_kv_tile_idx && kv_tile_idx > kv_start;
            kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
+
+        /*
+        if (threadIdx.x == 1) {
+          printf("producer kv_tile_idx: %d kv_start: %d kv_end: %d thread block idx: %d idy: %d clusterBlockRank: %d\n", kv_tile_idx, kv_start, kv_end, blockIdx.x, blockIdx.y, clusterBlockRank);
+        }
+        */
         pipeline_k.producer_acquire(smem_pipe_write_k);
 
         Tensor tKgKi = tKgK(_, _, _, kv_tile_idx_decrement(kv_tile_idx));  // (CPY, CPY_KV, CPY_D)

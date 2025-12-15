@@ -54,8 +54,12 @@ class MinHeap {
 
  private:
   // Custom comparator for the min-heap: compare based on 'val' in the pair
+  // When costs are equal, prefer lower index (for sequential CTA assignment)
   static bool compare(const Element& a, const Element& b) {
-    return a.second > b.second;  // create a min-heap based on val
+    if (a.second != b.second) {
+      return a.second > b.second;  // create a min-heap based on val
+    }
+    return a.first > b.first;  // tiebreaker: prefer lower index
   }
 
   std::vector<Element> heap_;

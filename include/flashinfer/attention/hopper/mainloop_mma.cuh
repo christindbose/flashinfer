@@ -216,6 +216,13 @@ CUTLASS_DEVICE void mma_f16(
 #pragma unroll 1
   for (; kv_tile_idx > swa_end_kv_tile_idx + 1 && kv_tile_idx > kv_start; kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
     //printf("inn non unroll loop");
+
+    /*
+    if (threadIdx.x == 130) {
+      printf("kv_tile_idx: %d\n", kv_tile_idx);
+    }
+    */
+
     Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
     consumer_wait(pipeline_k, smem_pipe_read_k);
     WarpScheduler::barrier_sync();
@@ -252,7 +259,11 @@ CUTLASS_DEVICE void mma_f16(
                tOrP);
   }
 
-  
+  /*
+  if (threadIdx.x == 130) {
+    printf("final kv_tile_idx: %d\n", kv_tile_idx);
+  }
+  */
   //printf("LEFT_SLIDING_WINDOW: %d\n", LEFT_SLIDING_WINDOW);
   //printf("MULTIITEMSCORING: %d\n", MULTIITEMSCORING);
 
@@ -272,6 +283,12 @@ CUTLASS_DEVICE void mma_f16(
   ++smem_pipe_read_v;
 
   attention_updater.rescale_o(tOrO);
+
+  /*
+  if (threadIdx.x == 130) {
+    printf("going to return\n");
+  }
+  */
   return;
 }
 
