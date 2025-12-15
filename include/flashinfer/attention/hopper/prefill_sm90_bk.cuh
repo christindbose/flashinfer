@@ -46,7 +46,7 @@ template <typename CollectiveMainloop, typename CollectiveEpilogue, typename Ktr
           bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename TileScheduler,
           bool MULTIITEMSCORING = false>
 __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp, 1)
-                //__cluster_dims__(2, 1, 1)
+                __cluster_dims__(2, 1, 1)
     PrefillWithKVCacheKernel(CUTE_GRID_CONSTANT
                              typename CollectiveMainloop::Params const mainloop_params,
                              CUTE_GRID_CONSTANT
@@ -69,11 +69,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   static constexpr int CTA_Q = Ktraits::CTA_Q;
   static constexpr int CTA_KV = Ktraits::CTA_KV;
 
-
-
   static constexpr bool use_tma_load_kv = CollectiveMainloop::USE_TMA_LOAD_KV;
-
-  //printf("use_tma_load_kv: %d\n", use_tma_load_kv);
 
   using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
@@ -91,21 +87,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     CollectiveEpilogue::prefetch_tma_descriptors(epilogue_params);
   }
 
-  
-  /*
-  if ((warp_idx == 0) && (lane_predicate) && (threadIdx.x == 0) && (threadIdx.y == 0) && (threadIdx.z == 0)) {
-    printf("NUM_MMA_THREADS: %d\n", NUM_MMA_THREADS);
-    printf("NUM_COPY_THREADS: %d\n", NUM_COPY_THREADS);
-    printf("CTA_Q: %d\n", CTA_Q);
-    printf("CTA_KV: %d\n", CTA_KV);
-    
-    // terminate the program
-    
-  }
-  */
-  
-
-
   // Obtain warp index
   int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
 
@@ -116,13 +97,10 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   if constexpr (use_tma_load_kv) {
     pipeline_params.is_leader = warp_group_thread_idx == 0;
     pipeline_params.num_consumers = NUM_MMA_THREADS;
-  } 
-  
-  else {
+  } else {
     pipeline_params.producer_arv_count = NUM_COPY_THREADS;
     pipeline_params.consumer_arv_count = NUM_MMA_THREADS;
   }
-  
 
   if (warp_idx == 0 && lane_predicate) {
     shared_storage.barrier_Q.init(/*num_threads=*/1);
@@ -173,14 +151,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     maybe_max_item_len_ptr = mainloop_params.additional_params.maybe_max_item_len_ptr;
   }
 
-  if (warp_group_idx == 0) {
-    
-    //clock start
-    uint32_t start = 0;
-    asm volatile("mov.u32 %0, %%clock;" : "=r"(start)::"memory");
-
-
-      // Producer
+  if (warp_group_idx == 0) {  // Producer
     if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
     } else {
@@ -203,20 +174,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len,
               batch_idx] = block_coord;
 
-        
-        /*
-        if (threadIdx.x == 0){
-          // print on each value on different line
-          printf("q_tile_idx: %d\n", q_tile_idx);
-          printf("qo_head_idx: %d\n", qo_head_idx);
-          printf("kv_head_idx: %d\n", kv_head_idx);
-          printf("qo_indptr: %d\n", qo_indptr);
-          printf("kv_indptr: %d\n", kv_indptr);
-          printf("qo_len: %d\n", qo_len);
-          printf("kv_len: %d\n", kv_len);
-          printf("batch_idx: %d\n", batch_idx);
-        }
-        */
         if (q_tile_idx * CTA_Q >= qo_len) {
           continue;
         }
@@ -227,13 +184,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           scheduler.broadcast_next_work(work_tile_info);
           continue;
         }
-        
-        namespace cg = cooperative_groups;
-        cg::cluster_group cluster = cg::this_cluster();    
-        unsigned int clusterBlockRank = cluster.block_rank();
-        unsigned int cluster_size = static_cast<unsigned int>(cluster.dim_blocks().x);
-
-        
         int num_kv_tiles_outside_items_window = 0;
         int num_kv_tiles_prefix = 0;
         if constexpr (MULTIITEMSCORING) {
@@ -250,38 +200,15 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
               num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
         } else {
-          //printf("loading without multiitem scoring\n");
-
           collective_mainloop.load<LEFT_SLIDING_WINDOW>(
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx);
-          /*
-              collective_mainloop.load<LEFT_SLIDING_WINDOW>(
-                mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
-                shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx, 0,0, clusterBlockRank, cluster_size);
-            */
-                }
+        }
         ++work_idx;
       }
       collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
     }
-
-
-
-    uint32_t stop = 0;
-    asm volatile("mov.u32 %0, %%clock;" : "=r"(stop)::"memory");
-
-    float elapsed_time = (stop - start) / 1000.0f;
-    //printf("producer warp elapsed time: %f ms\n", elapsed_time);
-
-} else {  
-  
-  // Consumer
-
-  // start clock
-    uint32_t consumer_start = 0;
-    asm volatile("mov.u32 %0, %%clock;" : "=r"(consumer_start)::"memory");
-
+  } else {  // Consumer
     if constexpr (use_tma_load_kv) {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 240 : 160>();
     } else {
@@ -300,18 +227,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     CollectiveMainloop::WarpScheduler::mma_init();
     scheduler.init_consumer();
 
-    namespace cg = cooperative_groups;
-    cg::cluster_group cluster = cg::this_cluster();
-
-    unsigned int clusterBlockRank = cluster.block_rank();
-    unsigned int cluster_size = static_cast<unsigned int>(cluster.dim_blocks().x);
-
-    //printf("clusterBlockRank: %d, cluster_size: %d\n", clusterBlockRank, cluster_size);
-
-    
     int work_idx = 0;
     CUTLASS_PRAGMA_NO_UNROLL
-    
     for (auto work_tile_info = scheduler.get_initial_work(scheduler_params);
          work_tile_info.is_valid(scheduler_params);
          work_tile_info = scheduler.template get_next_work</*is_producer=*/false>(scheduler_params,
@@ -323,6 +240,17 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
       auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
           block_coord;
+        
+      //printf("block_coord: %d, %d, %d, %d, %d, %d, %d, %d\n", q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx);
+      //printf("SM_ID: %d, block_coord: %d, %d, %d, %d, %d, %d, %d, %d\n", 
+      //  __smid(), q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx);
+      
+      //if (lane_predicate) {
+      uint32_t ret;
+      asm("mov.u32 %0, %smid;" : "=r"(ret) );
+      //  printf("in SM_ID: %d\n", ret);
+      //}
+      //printf("in SM_ID: %d, block_coord: %d, %d, %d, %d, %d, %d, %d, %d\n", ret, q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx);
 
       AttentionVariant variant(mainloop_params, block_coord);
       auto attention_updater =
@@ -331,43 +259,13 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       if (q_tile_idx * CTA_Q >= qo_len) {
         continue;
       }
-      
-      //print block coord grid idx, block idx, blockidy
-
-      //printf("grid idx: %d, block idx: %d, blockidy: %d \n", blockIdx.x, blockIdx.y, blockIdx.z);
-
-
-      
       int num_kv_tiles =
           collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
-      
-      /*
-      if (cluster_size > 1){
-            num_kv_tiles = num_kv_tiles / cluster_size;
-      }
-      */
-      
-      
-      /*
-      if (num_kv_tiles % 2){
-        num_kv_tiles = num_kv_tiles - 1;
-      }
-      */
-      //printf("num_kv_tiles: %d\n", num_kv_tiles);
       if (num_kv_tiles <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
         collective_epilogue.store_zero(epilogue_params, shared_storage,
                                        threadIdx.x - NUM_COPY_THREADS, block_coord);
         continue;
       }
-
-      
-
-      
-      /*
-      if (warp_group_idx == 1){
-        printf("block idx: %d, blockidy: %d, clusterBlockRank: %d, q_tile_idx: %d, qo_indptr: %d, qo_len: %d, kv_len: %d, num_kv_tiles: %d \n", blockIdx.x, blockIdx.y, clusterBlockRank, q_tile_idx, qo_indptr, qo_len, kv_len, num_kv_tiles);
-      }
-      */
 
       int swa_begin_kv_tile_idx = 0;
       int swa_end_kv_tile_idx = -1;
@@ -395,38 +293,17 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
       }
 
-      /*
       namespace cg = cooperative_groups;
       cg::cluster_group cluster = cg::this_cluster();
   
       unsigned int clusterBlockRank = cluster.block_rank();
       unsigned int cluster_size = static_cast<unsigned int>(cluster.dim_blocks().x);
-      */
-      //printf("clusterBlockRank: %d, cluster_size: %d\n", clusterBlockRank, cluster_size);
+      
+      printf("clusterBlockRank: %d, cluster_size: %d\n", clusterBlockRank, cluster_size);
+      //printf("in SM_ID: %d, clusterBlockRank: %d, cluster_size: %d\n", ret, clusterBlockRank, cluster_size);
+      
       //for (int i = 0; i < cluster_size; i++){
 
-
-          /*
-          if   (threadIdx.x == 0){
-            //print all the values on each line
-            printf("q_tile_idx: %d\n", q_tile_idx);
-            printf("qo_head_idx: %d\n", qo_head_idx);
-            printf("kv_head_idx: %d\n", kv_head_idx);
-            printf("qo_indptr: %d\n", qo_indptr);
-            printf("kv_indptr: %d\n", kv_indptr);
-            printf("qo_len: %d\n", qo_len);
-            printf("kv_len: %d\n", kv_len);
-            printf("batch_idx: %d\n", batch_idx);
-            printf("num_kv_tiles: %d\n", num_kv_tiles);
-            printf("swa_begin_kv_tile_idx: %d\n", swa_begin_kv_tile_idx);
-            printf("swa_end_kv_tile_idx: %d\n", swa_end_kv_tile_idx);
-            printf("threadIdx.x: %d\n", threadIdx.x);
-            printf("work_idx: %d\n", work_idx);
-            printf("q_tile_idx: %d\n", q_tile_idx);
-            printf("shared_storage: %p\n", &shared_storage);
-          }
-          */
-          
           
           mma_f16<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
               CollectiveMainloop::WarpScheduler>(
@@ -436,47 +313,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
           num_kv_tiles_outside_items_window, num_kv_tiles_prefix, clusterBlockRank, cluster_size);
           
-
-          /*
-          for (int i = 0; i < cluster_size; i++){
-          
-          mma_f16<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-              CollectiveMainloop::WarpScheduler>(
-          mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-          tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
-          threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-          qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-          num_kv_tiles_outside_items_window, num_kv_tiles_prefix, i, cluster_size);
-          }
-
-          */
-          /*mma_f16_dummy<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-          CollectiveMainloop::WarpScheduler>(
-      mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-      tOrO_1, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
-      threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-      qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-      num_kv_tiles_outside_items_window, num_kv_tiles_prefix, 0, cluster_size);
-*/
-          /*
-          mma_f16<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-          CollectiveMainloop::WarpScheduler>(
-      mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-      tOrO_1, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
-      threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-      qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-      num_kv_tiles_outside_items_window, num_kv_tiles_prefix, 1, cluster_size);
-          */
-          /*
-
-          mma_f16<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-          CollectiveMainloop::WarpScheduler>(
-      mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-      tOrO, tOrO_1, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
-      threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-      qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-      num_kv_tiles_outside_items_window, num_kv_tiles_prefix, clusterBlockRank, cluster_size);
-          */
 
           /*
           mma_f16_2c<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
@@ -491,17 +327,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
           
           //collective_epilogue.store(epilogue_params, tOrO_1, attention_updater.get_lse(), shared_storage,
-          //                      tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
+          //                     tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
       //__syncthreads();
       //}
       ++work_idx;
     }
     collective_epilogue.store_tail();
-
-    uint32_t consumer_stop = 0;
-    asm volatile("mov.u32 %0, %%clock;" : "=r"(consumer_stop)::"memory");
-    float consumer_elapsed_time = (consumer_stop - consumer_start) / 1000.0f;
-    //printf("consumer warp elapsed time: %f ms\n", consumer_elapsed_time);
   }
 }
 
@@ -579,10 +410,12 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   using CollectiveMainloop = SparseCollectiveMainloop<typename Params::AdditionalParams,
                                                       KernelTraits, CAUSAL, MULTIITEMSCORING>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
-  using Scheduler =
-      std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
-                         BatchPrefillPersistentTileScheduler<IdType>>;
-
+  //using Scheduler =
+  //    std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
+  //                       BatchPrefillPersistentTileScheduler<IdType>>;
+  
+  using Scheduler = BatchPrefillTileScheduler<IdType>;
+  
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
       {params.q_ptr,
        get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_QK,
@@ -622,11 +455,6 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   auto kernel =
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
                                       LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
-  
-  // For cudaLaunchKernelEx, we need the typed kernel function pointer
-  auto typed_kernel = PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
-                                               LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
-  
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -639,32 +467,8 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
   static constexpr int ctaSize = KernelTraits::NUM_WARPS * 32;
   dim3 block_dims(ctaSize);
-  
-  // Original cudaLaunchKernel version (commented out)
-  // void* args[] = {&mainloop_params, &epilogue_params, &scheduler_params};
-  // FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
-  
-  // Use cudaLaunchKernelEx instead of cudaLaunchKernel
-  cudaLaunchConfig_t config = {};
-  config.gridDim = grid_dims;
-  config.blockDim = block_dims;
-  config.dynamicSmemBytes = smem_size;
-  config.stream = stream;
-
-  cudaLaunchAttribute attribute[2];
-  attribute[0].id = cudaLaunchAttributeClusterDimension;
-  attribute[0].val.clusterDim.x = 2; // Cluster size in X-dimension
-  attribute[0].val.clusterDim.y = 1;
-  attribute[0].val.clusterDim.z = 1;
-  
-  attribute[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
-  attribute[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyDefault; //cudaClusterSchedulingPolicySpread;
-  
-  config.attrs = attribute;
-  config.numAttrs = 2;
-
-  
-  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, typed_kernel, mainloop_params, epilogue_params, scheduler_params));
+  void* args[] = {&mainloop_params, &epilogue_params, &scheduler_params};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
 
   return cudaSuccess;
 }

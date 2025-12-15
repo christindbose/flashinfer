@@ -170,7 +170,10 @@ struct SparseCollectiveMainloop {
                            typename Scheduler::WorkTileInfo& work_tile_info,
                            BlockCoord const& block_coord, int work_idx,
                            const int num_kv_tiles_outside_items_window = 0,
-                           const int num_kv_tiles_prefix = 0) {
+                           const int num_kv_tiles_prefix = 0, const int clusterBlockRank = 0,
+                           const int cluster_size = 1) {
+
+    //printf("in load");
     int thread_idx = threadIdx.x;
     int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (thread_idx / 32) % 4, 0);
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
@@ -193,7 +196,20 @@ struct SparseCollectiveMainloop {
                       group_modes<0, 2>(gQ_x));  // (TMA), (TMA)
 
     int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
-    int kv_tile_idx = num_kv_tiles - 1;
+
+    //printf("num_kv_tiles: %d\n", num_kv_tiles);
+    //int kv_tile_idx = num_kv_tiles - 1;
+    int tiles_per_cluster = num_kv_tiles / cluster_size;
+    //int kv_tile_idx = num_kv_tiles - clusterBlockRank - 1;
+    int kv_tile_idx = num_kv_tiles - tiles_per_cluster * clusterBlockRank - 1;
+
+
+    /*
+    if (cluster_size > 1){
+      kv_tile_idx = num_kv_tiles - clusterBlockRank - 1;
+    }
+    */
+
     int swa_begin_kv_tile_idx = 0;
     if constexpr (LEFT_SLIDING_WINDOW) {
       swa_begin_kv_tile_idx = get_swa_begin_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,
@@ -242,8 +258,17 @@ struct SparseCollectiveMainloop {
       auto s_coords = tVcVGroup(_0{}, coords);
       return elem_less(get<0>(s_coords), valid_last_kv_tile_size);
     };
+    
     auto kv_tile_idx_decrement = [&](int kv_tile_idx) {
+
       int result = kv_tile_idx - 1;
+      
+      /*
+      if (cluster_size > 1){
+        result = kv_tile_idx - cluster_size;
+      }
+      */
+
       if constexpr (MULTIITEMSCORING) {
         if ((kv_tile_idx == num_kv_tiles_outside_items_window) &
             (kv_tile_idx >= num_kv_tiles_prefix)) {

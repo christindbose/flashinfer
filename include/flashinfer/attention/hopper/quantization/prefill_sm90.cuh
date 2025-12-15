@@ -46,6 +46,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                                 typename CollectiveEpilogue::Params const epilogue_params,
                                 CUTE_GRID_CONSTANT
                                 typename TileScheduler::Params const scheduler_params) {
+
+  printf("\n in fp8 prefill kernel");
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using DTypeO = typename Ktraits::DTypeO;
@@ -256,6 +258,7 @@ cudaError_t SingleFP8PrefillWithKVCacheKernelTraitsDispatched(Params& params, cu
   using DTypeO = typename KernelTraits::DTypeO;
   using TileShape_QKD = typename KernelTraits::TileShape_QKD;
 
+  printf("\n in fp8 prefill kernel traits dispatched");
   using CollectiveMainloop =
       FP8CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
   using CollectiveEpilogue = FP8CollectiveEpilogue<KernelTraits>;

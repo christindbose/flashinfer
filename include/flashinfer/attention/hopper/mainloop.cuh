@@ -158,7 +158,9 @@ struct CollectiveMainloop {
                            PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
                            Scheduler& scheduler, typename Scheduler::Params const& scheduler_params,
                            typename Scheduler::WorkTileInfo& work_tile_info,
-                           BlockCoord const& block_coord, int work_idx) {
+                           BlockCoord const& block_coord, int work_idx, const int num_kv_tiles_outside_items_window = 0,
+                           const int num_kv_tiles_prefix = 0, const int clusterBlockRank = 0,
+                           const int cluster_size = 1) {
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
     Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
