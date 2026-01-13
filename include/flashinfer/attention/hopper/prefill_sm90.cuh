@@ -107,16 +107,18 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   */
   
   
-  // Use proper CUTLASS ClusterTransactionBarrier type for cluster-aware mbarriers
-  __shared__ alignas(64) cutlass::arch::ClusterTransactionBarrier bar;
-
+  // Use raw buffer for cluster mbarrier (64 bytes for cluster-aware mbarriers on SM90)
+  // NOTE: mbarrier_init PTX instruction causes misaligned address errors with cluster operations
+  // Keeping declaration but initialization commented out until proper cluster-aware initialization is implemented
+  //alignas(64) __shared__ uint64_t bar[8];  // 64 bytes = 8 * uint64_t
   
-  if (warp_idx == 0 && lane_predicate) 
-  {
-    // Initialize using CUTLASS method instead of PTX instruction for cluster compatibility
-    bar.init(NUM_MMA_THREADS);
-  }
-  __syncthreads();
+  // TODO: Initialize mbarrier properly for cluster operations
+  // The PTX mbarrier_init instruction doesn't work correctly with cluster address spaces
+  // if (warp_idx == 0 && lane_predicate) 
+  // {
+  //   cuda::ptx::mbarrier_init(bar, NUM_MMA_THREADS);
+  // }
+  //__syncthreads();
   
 
   // Obtain warp index
@@ -140,6 +142,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   if (warp_idx == 0 && lane_predicate) {
     shared_storage.barrier_Q.init(/*num_threads=*/1);
     shared_storage.barrier_O.init(/*num_threads=*/1);
+    shared_storage.barrier_r.init(/*num_threads=*/NUM_MMA_THREADS);
   }
   // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
   MainloopPipeline pipeline_k = [&] {
@@ -643,11 +646,11 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   auto typed_kernel = PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
                                                LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
   
-  // Add extra space for the static __shared__ ClusterTransactionBarrier bar in the kernel
+  // Add extra space for the static __shared__ alignas(64) uint64_t bar[8] in the kernel
   // Static shared variables are placed before dynamic shared memory, so we must account for it
-  // alignas(64) ensures proper alignment but doesn't affect size - we just need sizeof(type)
-  constexpr int STATIC_SMEM_BAR_SIZE = sizeof(cutlass::arch::ClusterTransactionBarrier);
-  int smem_size = sizeof(typename KernelTraits::SharedStorage) + STATIC_SMEM_BAR_SIZE;
+  //constexpr int STATIC_SMEM_BAR_SIZE = 64;  // 8 * sizeof(uint64_t) = 64 bytes
+  //int smem_size = sizeof(typename KernelTraits::SharedStorage) + STATIC_SMEM_BAR_SIZE;
+  int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
