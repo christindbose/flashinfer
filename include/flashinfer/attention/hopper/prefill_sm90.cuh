@@ -33,6 +33,8 @@
 
 #include <cooperative_groups.h>
 
+#include <cuda/barrier>
+
 namespace flashinfer {
 
 using namespace cute;
@@ -91,8 +93,9 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     CollectiveEpilogue::prefetch_tma_descriptors(epilogue_params);
   }
 
-  
+
   /*
+  
   if ((warp_idx == 0) && (lane_predicate) && (threadIdx.x == 0) && (threadIdx.y == 0) && (threadIdx.z == 0)) {
     printf("NUM_MMA_THREADS: %d\n", NUM_MMA_THREADS);
     printf("NUM_COPY_THREADS: %d\n", NUM_COPY_THREADS);
@@ -100,11 +103,21 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     printf("CTA_KV: %d\n", CTA_KV);
     
     // terminate the program
-    
   }
   */
   
+  
+  // Use proper CUTLASS ClusterTransactionBarrier type for cluster-aware mbarriers
+  __shared__ alignas(64) cutlass::arch::ClusterTransactionBarrier bar;
 
+  
+  if (warp_idx == 0 && lane_predicate) 
+  {
+    // Initialize using CUTLASS method instead of PTX instruction for cluster compatibility
+    bar.init(NUM_MMA_THREADS);
+  }
+  __syncthreads();
+  
 
   // Obtain warp index
   int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
@@ -489,8 +502,9 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
           num_kv_tiles_outside_items_window, num_kv_tiles_prefix, clusterBlockRank, cluster_size);
           */
-          collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
-                                tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
+
+          //collective_epilogue.store_new(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
+          //                      tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank);
           
           //collective_epilogue.store(epilogue_params, tOrO_1, attention_updater.get_lse(), shared_storage,
           //                      tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
@@ -629,7 +643,11 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   auto typed_kernel = PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
                                                LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
   
-  int smem_size = sizeof(typename KernelTraits::SharedStorage);
+  // Add extra space for the static __shared__ ClusterTransactionBarrier bar in the kernel
+  // Static shared variables are placed before dynamic shared memory, so we must account for it
+  // alignas(64) ensures proper alignment but doesn't affect size - we just need sizeof(type)
+  constexpr int STATIC_SMEM_BAR_SIZE = sizeof(cutlass::arch::ClusterTransactionBarrier);
+  int smem_size = sizeof(typename KernelTraits::SharedStorage) + STATIC_SMEM_BAR_SIZE;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -812,6 +830,7 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
                                                    cudaStream_t stream) {
+  printf("BatchPrefillWithPagedKVCacheDispatched\n");
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
