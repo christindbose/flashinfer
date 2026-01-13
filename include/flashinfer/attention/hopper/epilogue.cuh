@@ -15,6 +15,8 @@
 #include "named_barrier.cuh"
 #include "utils.cuh"
 
+#include <cooperative_groups.h>
+
 namespace flashinfer {
 
 using namespace cute;
@@ -170,7 +172,7 @@ struct CollectiveEpilogue {
     cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
     cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-
+    
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
     Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
                                             qo_len)(_, qo_tile_idx);
@@ -203,6 +205,60 @@ struct CollectiveEpilogue {
     write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
                               select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
                               qo_head_idx, qo_indptr, qo_len, write_warp_idx);
+  }
+
+  
+  template <typename BlockCoord, typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE,
+            typename TiledMma>
+  CUTLASS_DEVICE void store_new(Params const& epilogue_params, FrgTensorO const& tOrO,
+                            FrgTensorLSE const& lse, SharedStorage& shared_storage,
+                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord, const int clusterBlockRank = 0) {
+    auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
+        block_coord;
+    Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
+    auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
+    auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
+
+    Tensor tOrO_out = convert_type<DTypeO>(tOrO);
+    Tensor tOrO_retile = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
+    Tensor tOsO = smem_thr_copy_O.partition_D(sO);            // ((Atom,AtomNum),PIPE_M,PIPE_N)
+
+    // Make sure all WGs have finished reading V
+    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
+                                      /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
+    cute::copy(smem_tiled_copy_O, tOrO_retile, tOsO);
+    cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
+    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+                                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    
+    shared_storage.barrier_r.arrive();
+    shared_storage.barrier_r.arrive(1-clusterBlockRank);
+
+
+    
+    if (clusterBlockRank == 0){
+      //will implement sync later.
+      //read shared memory from cluster rank 1
+      // sync on cluster rank 1
+
+      cutlass::ConsumerToken barrier_token =
+      static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r.try_wait(1));
+      if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
+            shared_storage.barrier_r.wait(1);
+      }
+  
+      Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 1)), SmemLayoutO{});
+      Tensor tOrO_out_1 = convert_type<DTypeO>(tOrO);
+      Tensor tOrO_retile_1 = smem_thr_copy_O.retile_S(tOrO_out_1);
+      Tensor tOsO_1 = smem_thr_copy_O.partition_D(sO_1);
+      //cute::copy(smem_tiled_copy_O, tOrO_retile_1, tOsO_1);
+
+      }
+    
+
   }
 
   CUTLASS_DEVICE void store_tail() {
