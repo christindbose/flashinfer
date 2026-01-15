@@ -21,6 +21,18 @@ namespace flashinfer {
 
 using namespace cute;
 
+// Debug utility: query the SM ID executing the current thread.
+// Note: SM assignment is dynamic and can change run-to-run.
+CUTLASS_DEVICE uint32_t smid() {
+#if defined(__CUDA_ARCH__)
+  uint32_t id;
+  asm volatile("mov.u32 %0, %smid;" : "=r"(id));
+  return id;
+#else
+  return 0u;
+#endif
+}
+
 template <int NUM_COPY_THREADS, typename DTypeO, typename TiledCopyO, typename LayoutO,
           typename TileShapeO, typename SMemO>
 __forceinline__ __device__ void write_tiled(DTypeO* O, const TiledCopyO& tiled_copy_O,
@@ -233,14 +245,18 @@ struct CollectiveEpilogue {
     
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
+
+    // printf SM id through the register
+    //printf("SM id: %u\n", smid());
+
     
     if (clusterBlockRank == 0){
       shared_storage.barrier_r.arrive();
-      //printf("arrive on cluster rank 0\n");
+      //printf("arrive on cluster rank 0 SM id: %u\n", smid());
     }
     if (clusterBlockRank == 1){
       shared_storage.barrier_r.arrive(static_cast<uint32_t>(0), 1UL);
-      //printf("arrive on cluster rank 1\n");
+      //printf("arrive on cluster rank 1 SM id: %u\n", smid());
     }
     //shared_storage.barrier_r.arrive(1-clusterBlockRank);
 
@@ -252,10 +268,11 @@ struct CollectiveEpilogue {
       // sync on cluster rank 1
 
       cutlass::ConsumerToken barrier_token =
-      static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r.try_wait(1));
+      static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r.try_wait(0));
       if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
-            printf("barrier_token: %d\n", barrier_token);
-            shared_storage.barrier_r.wait(1);
+            //printf("barrier_token: %u SM id: %u\n",
+                   //static_cast<unsigned>(barrier_token.get()), smid());
+            shared_storage.barrier_r.wait(0);
       }
   
       Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 1)), SmemLayoutO{});
