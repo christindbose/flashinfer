@@ -93,6 +93,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     CollectiveEpilogue::prefetch_tma_descriptors(epilogue_params);
   }
 
+  namespace cg = cooperative_groups;
+  cg::cluster_group cluster = cg::this_cluster();
+  unsigned int clusterBlockRank = cluster.block_rank();
+  unsigned int cluster_size = static_cast<unsigned int>(cluster.dim_blocks().x);
+
+  //printf("clusterBlockRank: %d, cluster_size: %d\n", clusterBlockRank, cluster_size);
 
   /*
   
@@ -142,7 +148,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   if (warp_idx == 0 && lane_predicate) {
     shared_storage.barrier_Q.init(/*num_threads=*/1);
     shared_storage.barrier_O.init(/*num_threads=*/1);
-    shared_storage.barrier_r.init(/*num_threads=*/NUM_MMA_THREADS);
+    shared_storage.barrier_r.init(/*num_threads=*/cluster_size * NUM_MMA_THREADS);
+    //printf("barrier_r initialized with num_threads: %d\n", cluster_size * NUM_MMA_THREADS);
   }
   // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
   MainloopPipeline pipeline_k = [&] {
@@ -244,10 +251,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           continue;
         }
         
-        namespace cg = cooperative_groups;
-        cg::cluster_group cluster = cg::this_cluster();    
-        unsigned int clusterBlockRank = cluster.block_rank();
-        unsigned int cluster_size = static_cast<unsigned int>(cluster.dim_blocks().x);
+
 
         
         int num_kv_tiles_outside_items_window = 0;
@@ -506,8 +510,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           num_kv_tiles_outside_items_window, num_kv_tiles_prefix, clusterBlockRank, cluster_size);
           */
 
-          //collective_epilogue.store_new(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
-          //                      tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank);
+          collective_epilogue.store_new(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
+                                tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank);
           
           //collective_epilogue.store(epilogue_params, tOrO_1, attention_updater.get_lse(), shared_storage,
           //                      tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);

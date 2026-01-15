@@ -234,8 +234,15 @@ struct CollectiveEpilogue {
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
     
-    shared_storage.barrier_r.arrive();
-    shared_storage.barrier_r.arrive(1-clusterBlockRank);
+    if (clusterBlockRank == 0){
+      shared_storage.barrier_r.arrive();
+      //printf("arrive on cluster rank 0\n");
+    }
+    if (clusterBlockRank == 1){
+      shared_storage.barrier_r.arrive(static_cast<uint32_t>(0), 1UL);
+      //printf("arrive on cluster rank 1\n");
+    }
+    //shared_storage.barrier_r.arrive(1-clusterBlockRank);
 
 
     
@@ -247,6 +254,7 @@ struct CollectiveEpilogue {
       cutlass::ConsumerToken barrier_token =
       static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r.try_wait(1));
       if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
+            printf("barrier_token: %d\n", barrier_token);
             shared_storage.barrier_r.wait(1);
       }
   
@@ -254,6 +262,15 @@ struct CollectiveEpilogue {
       Tensor tOrO_out_1 = convert_type<DTypeO>(tOrO);
       Tensor tOrO_retile_1 = smem_thr_copy_O.retile_S(tOrO_out_1);
       Tensor tOsO_1 = smem_thr_copy_O.partition_D(sO_1);
+
+      // Reduce tOsO_1 and tOsO
+      // TODO: Implement reduce
+      //Tensor tOsO_reduced = tOsO_1 + tOsO;
+      // Write tOsO_reduced to output
+      // TODO: Implement write
+      //cute::copy(smem_tiled_copy_O, tOrO_retile_1, tOsO_reduced);
+
+
       //cute::copy(smem_tiled_copy_O, tOrO_retile_1, tOsO_1);
 
       }
