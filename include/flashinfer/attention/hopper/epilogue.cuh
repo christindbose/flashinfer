@@ -295,7 +295,7 @@ struct CollectiveEpilogue {
       
       
       
-      Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 0)), SmemLayoutO{});
+      Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 1)), SmemLayoutO{});
       //Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 0)), SmemLayoutO{});
 
       // Load peer CTA's shared-memory tile (sO_1) into registers.
@@ -313,15 +313,26 @@ struct CollectiveEpilogue {
         tOrO_1_flat(i) = tOsO_1_flat(i);
       }
 
-      printf("tOrO_1: %f\n", static_cast<float>(tOrO_1(0, 0, 0)));
+      //printf("tOrO_1: %f\n", static_cast<float>(tOrO_1(0, 0, 0)));
       
 
-
+      shared_storage.barrier_r_end.arrive(static_cast<uint32_t>(1), 1UL);
 
 
 
 
       }
+      else{
+
+        cutlass::ConsumerToken barrier_token =
+        static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_end.try_wait(0));
+        if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
+          //printf("barrier_token: %u SM id: %u\n",
+                //static_cast<unsigned>(barrier_token.get()), smid());
+          shared_storage.barrier_r_end.wait(0);
+        }
+      }
+
     
 
   }
