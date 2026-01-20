@@ -36,7 +36,8 @@ struct SharedStorageQKVO {
     cutlass::arch::ClusterBarrier barrier_O;
     typename MainloopPipeline::SharedStorage pipeline_k;
     typename MainloopPipeline::SharedStorage pipeline_v;
-    cutlass::arch::ClusterBarrier barrier_r;
+    cutlass::arch::ClusterBarrier barrier_r_start;
+    cutlass::arch::ClusterBarrier barrier_r_end;
   };
 };
 

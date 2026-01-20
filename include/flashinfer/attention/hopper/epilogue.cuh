@@ -11,6 +11,7 @@
 
 #include "../../math.cuh"
 #include "cute/tensor.hpp"
+#include "cute/arch/copy_sm75.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "named_barrier.cuh"
 #include "utils.cuh"
@@ -241,8 +242,25 @@ struct CollectiveEpilogue {
     cute::copy(smem_tiled_copy_O, tOrO_retile, tOsO);
     cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
     cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
-                                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+      cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);    
+
     
+    /*
+                                        
+    int write_warp_idx = NUM_WARPS - 1;
+    if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
+      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+                                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    }
+    TiledCopyO gmem_tiled_copy_O;
+    write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
+                              select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
+                              qo_head_idx, qo_indptr, qo_len, write_warp_idx);
+    
+    */
+
+    //printf("tOrO: %f\n", tOrO(0, 0, 0));
+
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
 
@@ -251,11 +269,11 @@ struct CollectiveEpilogue {
 
     
     if (clusterBlockRank == 0){
-      shared_storage.barrier_r.arrive();
+      shared_storage.barrier_r_start.arrive();
       //printf("arrive on cluster rank 0 SM id: %u\n", smid());
     }
     if (clusterBlockRank == 1){
-      shared_storage.barrier_r.arrive(static_cast<uint32_t>(0), 1UL);
+      shared_storage.barrier_r_start.arrive(static_cast<uint32_t>(0), 1UL);
       //printf("arrive on cluster rank 1 SM id: %u\n", smid());
     }
     //shared_storage.barrier_r.arrive(1-clusterBlockRank);
@@ -268,27 +286,40 @@ struct CollectiveEpilogue {
       // sync on cluster rank 1
 
       cutlass::ConsumerToken barrier_token =
-      static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r.try_wait(0));
+      static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_start.try_wait(0));
       if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
             //printf("barrier_token: %u SM id: %u\n",
-                   //static_cast<unsigned>(barrier_token.get()), smid());
-            shared_storage.barrier_r.wait(0);
+                  //static_cast<unsigned>(barrier_token.get()), smid());
+            shared_storage.barrier_r_start.wait(0);
       }
-  
-      Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 1)), SmemLayoutO{});
-      Tensor tOrO_out_1 = convert_type<DTypeO>(tOrO);
-      Tensor tOrO_retile_1 = smem_thr_copy_O.retile_S(tOrO_out_1);
-      Tensor tOsO_1 = smem_thr_copy_O.partition_D(sO_1);
+      
+      
+      
+      Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 0)), SmemLayoutO{});
+      //Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 0)), SmemLayoutO{});
 
-      // Reduce tOsO_1 and tOsO
-      // TODO: Implement reduce
-      //Tensor tOsO_reduced = tOsO_1 + tOsO;
-      // Write tOsO_reduced to output
-      // TODO: Implement write
-      //cute::copy(smem_tiled_copy_O, tOrO_retile_1, tOsO_reduced);
+      // Load peer CTA's shared-memory tile (sO_1) into registers.
+      // Use partition_S for smem (source layout for reading)
+      Tensor tOsO_1 = smem_thr_copy_O.partition_S(sO_1);  // Partition shared memory (S layout - for reading)
+      Tensor tOrO_1 = make_fragment_like(tOsO_1);          // Create register fragment matching S layout
+      
+      // Copy FROM shared memory (sO_1) TO registers (tOrO_1)
+      // Flatten both tensors and copy element by element - simpler and more reliable
+      auto tOsO_1_flat = flatten(tOsO_1);
+      auto tOrO_1_flat = flatten(tOrO_1);
+      CUTE_STATIC_ASSERT_V(size(tOsO_1_flat) == size(tOrO_1_flat));
+      CUTE_UNROLL
+      for (int i = 0; i < size(tOrO_1_flat); ++i) {
+        tOrO_1_flat(i) = tOsO_1_flat(i);
+      }
+
+      printf("tOrO_1: %f\n", static_cast<float>(tOrO_1(0, 0, 0)));
+      
 
 
-      //cute::copy(smem_tiled_copy_O, tOrO_retile_1, tOsO_1);
+
+
+
 
       }
     

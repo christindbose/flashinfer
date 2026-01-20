@@ -148,7 +148,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   if (warp_idx == 0 && lane_predicate) {
     shared_storage.barrier_Q.init(/*num_threads=*/1);
     shared_storage.barrier_O.init(/*num_threads=*/1);
-    shared_storage.barrier_r.init(/*num_threads=*/cluster_size * NUM_MMA_THREADS);
+    shared_storage.barrier_r_start.init(/*num_threads=*/cluster_size * NUM_MMA_THREADS);
     //printf("barrier_r initialized with num_threads: %d\n", cluster_size * NUM_MMA_THREADS);
   }
   // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
@@ -837,7 +837,7 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
                                                    cudaStream_t stream) {
-  printf("BatchPrefillWithPagedKVCacheDispatched\n");
+  //printf("BatchPrefillWithPagedKVCacheDispatched\n");
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
