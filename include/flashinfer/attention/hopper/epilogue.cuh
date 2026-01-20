@@ -304,14 +304,8 @@ struct CollectiveEpilogue {
       Tensor tOrO_1 = make_fragment_like(tOsO_1);          // Create register fragment matching S layout
       
       // Copy FROM shared memory (sO_1) TO registers (tOrO_1)
-      // Flatten both tensors and copy element by element - simpler and more reliable
-      auto tOsO_1_flat = flatten(tOsO_1);
-      auto tOrO_1_flat = flatten(tOrO_1);
-      CUTE_STATIC_ASSERT_V(size(tOsO_1_flat) == size(tOrO_1_flat));
-      CUTE_UNROLL
-      for (int i = 0; i < size(tOrO_1_flat); ++i) {
-        tOrO_1_flat(i) = tOsO_1_flat(i);
-      }
+      // Use implicit auto-vectorizing copy - CUTE will vectorize if layouts are compatible
+      cute::copy(tOsO_1, tOrO_1);
 
       //printf("tOrO_1: %f\n", static_cast<float>(tOrO_1(0, 0, 0)));
       
