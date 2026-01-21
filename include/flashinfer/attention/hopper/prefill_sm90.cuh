@@ -35,6 +35,16 @@
 
 #include <cuda/barrier>
 
+CUTLASS_DEVICE uint32_t smid() {
+  #if defined(__CUDA_ARCH__)
+    uint32_t id;
+    asm volatile("mov.u32 %0, %smid;" : "=r"(id));
+    return id;
+  #else
+    return 0u;
+  #endif
+  }
+
 namespace flashinfer {
 
 using namespace cute;
@@ -149,6 +159,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     shared_storage.barrier_Q.init(/*num_threads=*/1);
     shared_storage.barrier_O.init(/*num_threads=*/1);
     shared_storage.barrier_r_start.init(/*num_threads=*/cluster_size * NUM_MMA_THREADS);
+    shared_storage.barrier_r_end.init(/*num_threads=*/NUM_MMA_THREADS);
     //printf("barrier_r initialized with num_threads: %d\n", cluster_size * NUM_MMA_THREADS);
   }
   // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
@@ -391,6 +402,10 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       }
       */
 
+      //if (threadIdx.x == 0){
+        //printf("SMID: %d, warp_group_idx: %d, clusterBlockRank: %d, q_tile_idx: %d, qo_indptr: %d, qo_len: %d, kv_len: %d, num_kv_tiles: %d  \n", smid(), warp_group_idx, clusterBlockRank, q_tile_idx, qo_indptr, qo_len, kv_len, num_kv_tiles);
+      //}
+
       int swa_begin_kv_tile_idx = 0;
       int swa_end_kv_tile_idx = -1;
       if constexpr (LEFT_SLIDING_WINDOW) {
@@ -459,56 +474,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           num_kv_tiles_outside_items_window, num_kv_tiles_prefix, clusterBlockRank, cluster_size);
           
 
-          /*
-          for (int i = 0; i < cluster_size; i++){
-          
-          mma_f16<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-              CollectiveMainloop::WarpScheduler>(
-          mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-          tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
-          threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-          qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-          num_kv_tiles_outside_items_window, num_kv_tiles_prefix, i, cluster_size);
-          }
-
-          */
-          /*mma_f16_dummy<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-          CollectiveMainloop::WarpScheduler>(
-      mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-      tOrO_1, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
-      threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-      qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-      num_kv_tiles_outside_items_window, num_kv_tiles_prefix, 0, cluster_size);
-*/
-          /*
-          mma_f16<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-          CollectiveMainloop::WarpScheduler>(
-      mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-      tOrO_1, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
-      threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-      qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-      num_kv_tiles_outside_items_window, num_kv_tiles_prefix, 1, cluster_size);
-          */
-          /*
-
-          mma_f16<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-          CollectiveMainloop::WarpScheduler>(
-      mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-      tOrO, tOrO_1, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
-      threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-      qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-      num_kv_tiles_outside_items_window, num_kv_tiles_prefix, clusterBlockRank, cluster_size);
-          */
-
-          /*
-          mma_f16_2c<Ktraits, LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-              CollectiveMainloop::WarpScheduler>(
-          mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-          tOrO, tOrO_1, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
-          threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-          qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-          num_kv_tiles_outside_items_window, num_kv_tiles_prefix, clusterBlockRank, cluster_size);
-          */
 
           collective_epilogue.store_new(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank);
