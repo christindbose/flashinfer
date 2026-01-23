@@ -122,20 +122,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   }
   */
   
-  
-  // Use raw buffer for cluster mbarrier (64 bytes for cluster-aware mbarriers on SM90)
-  // NOTE: mbarrier_init PTX instruction causes misaligned address errors with cluster operations
-  // Keeping declaration but initialization commented out until proper cluster-aware initialization is implemented
-  //alignas(64) __shared__ uint64_t bar[8];  // 64 bytes = 8 * uint64_t
-  
-  // TODO: Initialize mbarrier properly for cluster operations
-  // The PTX mbarrier_init instruction doesn't work correctly with cluster address spaces
-  // if (warp_idx == 0 && lane_predicate) 
-  // {
-  //   cuda::ptx::mbarrier_init(bar, NUM_MMA_THREADS);
-  // }
-  //__syncthreads();
-  
+ 
 
   // Obtain warp index
   int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
@@ -240,17 +227,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         
         /*
         if (threadIdx.x == 0){
-          // print on each value on different line
-          printf("q_tile_idx: %d\n", q_tile_idx);
-          printf("qo_head_idx: %d\n", qo_head_idx);
-          printf("kv_head_idx: %d\n", kv_head_idx);
-          printf("qo_indptr: %d\n", qo_indptr);
-          printf("kv_indptr: %d\n", kv_indptr);
-          printf("qo_len: %d\n", qo_len);
-          printf("kv_len: %d\n", kv_len);
-          printf("batch_idx: %d\n", batch_idx);
+          // print on each value on same  line
+          printf("q_tile_idx: %d, qo_head_idx: %d, kv_head_idx: %d, qo_indptr: %d, kv_indptr: %d, qo_len: %d, kv_len: %d, batch_idx: %d\n", q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx);
         }
         */
+        
         if (q_tile_idx * CTA_Q >= qo_len) {
           continue;
         }
@@ -402,9 +383,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       }
       */
 
-      //if (threadIdx.x == 0){
-        //printf("SMID: %d, warp_group_idx: %d, clusterBlockRank: %d, q_tile_idx: %d, qo_indptr: %d, qo_len: %d, kv_len: %d, num_kv_tiles: %d  \n", smid(), warp_group_idx, clusterBlockRank, q_tile_idx, qo_indptr, qo_len, kv_len, num_kv_tiles);
-      //}
+      /*
+      if ((threadIdx.x == 128) || (threadIdx.x == 256)){
+        printf("SMID: %d, warp_group_idx: %d, clusterBlockRank: %d, q_tile_idx: %d, qo_indptr: %d, qo_len: %d, kv_len: %d, num_kv_tiles: %d  \n", smid(), warp_group_idx, clusterBlockRank, q_tile_idx, qo_indptr, qo_len, kv_len, num_kv_tiles);
+      }
+      */
 
       int swa_begin_kv_tile_idx = 0;
       int swa_end_kv_tile_idx = -1;
@@ -567,10 +550,13 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   using CollectiveMainloop = SparseCollectiveMainloop<typename Params::AdditionalParams,
                                                       KernelTraits, CAUSAL, MULTIITEMSCORING>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
-  using Scheduler =
-      std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
-                         BatchPrefillPersistentTileScheduler<IdType>>;
+  
+  //printf("SAME_SCHEDULE_FOR_ALL_HEADS: %d\n", SAME_SCHEDULE_FOR_ALL_HEADS);
 
+  //using Scheduler =
+  //    std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
+  //                         BatchPrefillPersistentTileScheduler<IdType>>;
+  using Scheduler = BatchPrefillTileScheduler<IdType>;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
       {params.q_ptr,
        get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_QK,
@@ -615,10 +601,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   auto typed_kernel = PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
                                                LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
   
-  // Add extra space for the static __shared__ alignas(64) uint64_t bar[8] in the kernel
-  // Static shared variables are placed before dynamic shared memory, so we must account for it
-  //constexpr int STATIC_SMEM_BAR_SIZE = 64;  // 8 * sizeof(uint64_t) = 64 bytes
-  //int smem_size = sizeof(typename KernelTraits::SharedStorage) + STATIC_SMEM_BAR_SIZE;
+
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -629,6 +612,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   FLASHINFER_CUDA_CALL(
       cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
   dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
+  //printf("grid_dims: %d %d %d\n", grid_dims.x, grid_dims.y, grid_dims.z);
   static constexpr int ctaSize = KernelTraits::NUM_WARPS * 32;
   dim3 block_dims(ctaSize);
   
