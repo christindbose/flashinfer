@@ -383,11 +383,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       }
       */
 
-      
+      /*      
       if ((threadIdx.x == 128) || (threadIdx.x == 256)){
         printf("SMID: %d, warp_group_idx: %d, clusterBlockRank: %d, q_tile_idx: %d, qo_indptr: %d, qo_len: %d, kv_len: %d, num_kv_tiles: %d  \n", smid(), warp_group_idx, clusterBlockRank, q_tile_idx, qo_indptr, qo_len, kv_len, num_kv_tiles);
       }
-      
+      */
 
       int swa_begin_kv_tile_idx = 0;
       int swa_end_kv_tile_idx = -1;
@@ -629,7 +629,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
 
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeClusterDimension;
-  attribute[0].val.clusterDim.x = 2; // Cluster size in X-dimension
+  attribute[0].val.clusterDim.x = 1; // Cluster size in X-dimension
   attribute[0].val.clusterDim.y = 1;
   attribute[0].val.clusterDim.z = 1;
   
