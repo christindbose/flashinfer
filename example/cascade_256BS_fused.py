@@ -23,7 +23,7 @@ def cu_prof_stop():
     
 
 # Parse command line arguments
-parser = argparse.ArgumentParser(description='FlashInfer Fused Cascade Attention (Option 1: Concatenate KV)')
+parser = argparse.ArgumentParser(description='FlashInfer Fused Cascade Attention (Combined Level)')
 parser.add_argument('--shared_kv_num_pages', type=int, default=512, 
                     help='Number of shared KV pages (default: 512)')
 parser.add_argument('--unique_kv_pages_per_seq', type=int, default=1,
@@ -54,8 +54,10 @@ print(f"  Total pages: {total_num_pages}")
 # Allocate workspace buffer
 workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
 
-# Use single-level BatchPrefillWithPagedKVCacheWrapper (not multi-level)
-wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+# Use MultiLevelCascadeAttentionWrapper with 1 level (combined shared + unique)
+wrapper = flashinfer.MultiLevelCascadeAttentionWrapper(
+    1, workspace_buffer, "NHD",
+)
 
 # Allocate KV cache
 kv_cache_at_layer = [
@@ -66,90 +68,94 @@ kv_cache_at_layer = [
 ]
 
 # ============================================================
-# Option 1: Concatenate shared + unique KV indices per sequence
-# Each sequence sees: [shared_page_0, ..., shared_page_N, unique_page_0, ..., unique_page_M]
+# Single Level with shared pages stored ONCE:
+# - KV Group 0: shared pages (all batch queries attend to this)
+# - KV Groups 1 to batch_size: unique pages per sequence
 # ============================================================
 
-# Build combined page indices for all sequences
-# For each sequence i: indices = [shared_pages..., unique_pages_for_seq_i...]
-combined_kv_page_indices_list = []
-for seq_idx in range(batch_size):
-    # Shared pages (same for all sequences)
-    shared_indices = torch.arange(shared_kv_num_pages, dtype=torch.int32, device="cuda:0")
-    
-    # Unique pages for this sequence
-    unique_start = shared_kv_num_pages + seq_idx * unique_kv_pages_per_seq
-    unique_indices = torch.arange(
-        unique_start, 
-        unique_start + unique_kv_pages_per_seq, 
-        dtype=torch.int32, 
+# combined_kv_page_indices: [shared_pages..., unique_seq0..., unique_seq1..., ...]
+# Shared pages stored exactly once
+shared_page_indices = torch.arange(shared_kv_num_pages, dtype=torch.int32, device="cuda:0")
+# Unique pages for all sequences
+unique_page_indices = torch.arange(shared_kv_num_pages, total_num_pages, dtype=torch.int32, device="cuda:0")
+# Concatenate: shared once + all unique
+combined_kv_page_indices = torch.cat([shared_page_indices, unique_page_indices])
+print(f"  combined_kv_page_indices : {combined_kv_page_indices}")
+
+# combined_kv_page_indptr: 
+# [0, shared_kv_num_pages, shared_kv_num_pages + unique_per_seq, shared_kv_num_pages + 2*unique_per_seq, ...]
+# - indptr[0] to indptr[1]: shared pages (group 0)
+# - indptr[1] to indptr[2]: unique pages for seq 0 (group 1)
+# - indptr[2] to indptr[3]: unique pages for seq 1 (group 2)
+# - etc.
+# Total: batch_size + 2 entries (1 shared group + batch_size unique groups + 1 for end)
+combined_kv_page_indptr = torch.cat([
+    torch.tensor([0, shared_kv_num_pages], dtype=torch.int32, device="cuda:0"),
+    torch.arange(
+        shared_kv_num_pages + unique_kv_pages_per_seq,
+        shared_kv_num_pages + (batch_size + 1) * unique_kv_pages_per_seq,
+        unique_kv_pages_per_seq,
+        dtype=torch.int32,
         device="cuda:0"
     )
-    
-    # Concatenate: [shared..., unique...]
-    seq_indices = torch.cat([shared_indices, unique_indices])
-    combined_kv_page_indices_list.append(seq_indices)
-
-# Flatten all indices into single tensor
-combined_kv_page_indices = torch.cat(combined_kv_page_indices_list)
-
-# Build combined indptr
-# Each sequence has (shared_kv_num_pages + unique_kv_pages_per_seq) pages
-pages_per_seq = shared_kv_num_pages + unique_kv_pages_per_seq
-combined_kv_page_indptr = torch.arange(
-    0, 
-    (batch_size + 1) * pages_per_seq, 
-    pages_per_seq,
-    dtype=torch.int32, 
-    device="cuda:0"
-)
-
-# Build combined last_page_len (last page of unique portion)
-# Assuming unique pages are fully filled
-combined_kv_last_page_len = torch.full(
-    (batch_size,), 
-    page_size,  # or set to actual last page length if partial
-    dtype=torch.int32, 
-    device="cuda:0"
-)
-
-# qo_indptr: one query per sequence (decode scenario)
-qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda:0")
-
-print(f"\nCombined KV structure:")
-print(f"  combined_kv_page_indices shape: {combined_kv_page_indices.shape}")
-print(f"  combined_kv_page_indptr shape: {combined_kv_page_indptr.shape}")
-print(f"  Pages per sequence: {pages_per_seq}")
-
-print(f"  combined_kv_page_indices : {combined_kv_page_indices}")
+])
 print(f"  combined_kv_page_indptr : {combined_kv_page_indptr}")
 
+# combined_kv_last_page_len: batch_size + 1 entries (1 for shared, batch_size for unique)
+combined_kv_last_page_len = torch.full(
+    (batch_size + 1,), 
+    page_size,
+    dtype=torch.int32, 
+    device="cuda:0"
+)
 
-# Plan the attention (single kernel)
+# qo_indptr: 
+# [0, batch_size, batch_size+1, batch_size+2, ..., 2*batch_size]
+# - Queries 0 to batch_size-1 attend to KV group 0 (shared)
+# - Query batch_size attends to KV group 1 (unique for seq 0)
+# - Query batch_size+1 attends to KV group 2 (unique for seq 1)
+# - etc.
+qo_indptr = torch.cat([
+    torch.tensor([0, batch_size], dtype=torch.int32, device="cuda:0"),
+    torch.arange(batch_size + 1, 2 * batch_size + 1, dtype=torch.int32, device="cuda:0")
+])
+print(f"  qo_indptr : {qo_indptr}")
+
+print(f"\nCombined KV structure (single level, shared stored once):")
+print(f"  combined_kv_page_indices shape: {combined_kv_page_indices.shape}")
+print(f"  combined_kv_page_indptr shape: {combined_kv_page_indptr.shape} (batch_size + 2 = {batch_size + 2})")
+print(f"  qo_indptr shape: {qo_indptr.shape} (batch_size + 2 = {batch_size + 2})")
+print(f"  Number of KV groups: {len(combined_kv_page_indptr) - 1} (1 shared + {batch_size} unique)")
+
+# Plan the attention (single level with combined KV)
 wrapper.plan(
-    qo_indptr,
-    combined_kv_page_indptr,
-    combined_kv_page_indices,
-    combined_kv_last_page_len,
+    [qo_indptr],
+    [combined_kv_page_indptr],
+    [combined_kv_page_indices],
+    [combined_kv_last_page_len],
     num_qo_heads,
     num_kv_heads,
     head_dim,
     page_size,
 )
-print("Finished planning fused cascade attention")
+print("Finished planning fused cascade attention (combined level)")
 
 # Run attention
+# Note: q needs 2*batch_size queries (batch_size for shared, batch_size for unique)
 outputs = []
 for i in range(num_layers):
-    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=torch.float16, device="cuda:0")
+    q = torch.randn(2 * batch_size, num_qo_heads, head_dim, dtype=torch.float16, device="cuda:0")
     
-    # Single kernel processes both shared + unique KV
+    # Single level processes: shared attention + unique attention
     o = wrapper.run(q, kv_cache_at_layer[i])
     outputs.append(o)
 
 print(f"\nOutput shape: {outputs[0].shape}")
-print(f"Output[0,0,0]: {outputs[0][0, 0, 0].item():.6f}")
-print("\nDone! Fused cascade attention completed in single kernel.")
+print(f"Output[0,0,0] (shared attention result): {outputs[0][0, 0, 0].item():.6f}")
+print(f"Output[{batch_size},0,0] (unique attention for seq 0): {outputs[0][batch_size, 0, 0].item():.6f}")
+print("\nDone! Fused cascade attention (combined level, shared stored once) completed.")
 
-# Note: This approach does NOT exploit sharing - shared KV is read batch_size times.
-# For true sharing benefits, need kernel modifications (Option 2 or 3).
+# Note: This stores shared pages once, but outputs are separate:
+# - outputs[0:batch_size]: attention over shared KV only
+# - outputs[batch_size:2*batch_size]: attention over unique KV per sequence
+# To get final cascade result, you need to manually merge these using cascade reduction.
