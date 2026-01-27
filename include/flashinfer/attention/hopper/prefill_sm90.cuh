@@ -81,6 +81,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   static constexpr int CTA_Q = Ktraits::CTA_Q;
   static constexpr int CTA_KV = Ktraits::CTA_KV;
 
+  bool kvsplit_mode = true;
+
 
 
   static constexpr bool use_tma_load_kv = CollectiveMainloop::USE_TMA_LOAD_KV;
@@ -272,7 +274,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
               
               collective_mainloop.load<LEFT_SLIDING_WINDOW>(
                 mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
-                shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx, 0,0, clusterBlockRank, cluster_size);
+                shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx, 0,0, clusterBlockRank, cluster_size, kvsplit_mode);
             
                 }
         ++work_idx;
@@ -383,11 +385,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       }
       */
 
-      /*      
+            
       if ((threadIdx.x == 128) || (threadIdx.x == 256)){
-        printf("SMID: %d, warp_group_idx: %d, clusterBlockRank: %d, q_tile_idx: %d, qo_indptr: %d, qo_len: %d, kv_len: %d, num_kv_tiles: %d  \n", smid(), warp_group_idx, clusterBlockRank, q_tile_idx, qo_indptr, qo_len, kv_len, num_kv_tiles);
+        printf("SMID: %d, warp_group_idx: %d, clusterBlockRank: %d, blockIdx.x: %d, blockIdx.y: %d, q_tile_idx: %d, qo_indptr: %d, qo_len: %d, kv_len: %d, num_kv_tiles: %d  \n", smid(), warp_group_idx, clusterBlockRank, blockIdx.x, blockIdx.y, q_tile_idx, qo_indptr, qo_len, kv_len, num_kv_tiles);
       }
-      */
+      
 
       int swa_begin_kv_tile_idx = 0;
       int swa_end_kv_tile_idx = -1;
@@ -454,13 +456,18 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
           qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-          num_kv_tiles_outside_items_window, num_kv_tiles_prefix, clusterBlockRank, cluster_size);
+          num_kv_tiles_outside_items_window, num_kv_tiles_prefix, clusterBlockRank, cluster_size, kvsplit_mode);
           
 
 
+
+        if (kvsplit_mode){
           collective_epilogue.store_new(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
-                                tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank, cluster_size);
-          
+                                tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank, cluster_size, kvsplit_mode);
+        } else {
+          collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
+                                      tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
+        }
           //collective_epilogue.store(epilogue_params, tOrO_1, attention_updater.get_lse(), shared_storage,
           //                      tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
       //__syncthreads();
@@ -629,7 +636,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
 
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeClusterDimension;
-  attribute[0].val.clusterDim.x = 1; // Cluster size in X-dimension
+  attribute[0].val.clusterDim.x = 2; // Cluster size in X-dimension
   attribute[0].val.clusterDim.y = 1;
   attribute[0].val.clusterDim.z = 1;
   

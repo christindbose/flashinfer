@@ -78,6 +78,65 @@ __forceinline__ __device__ void write_O(ElemO* O, const TiledCopyO& tiled_copy_O
                                 qo_tile_idx, qo_head_idx, qo_indptr, qo_len);
 }
 
+template <int NUM_COPY_THREADS, typename DTypeO, typename TiledCopyO, typename LayoutO,
+          typename TileShapeO, typename RegTensorO>
+__forceinline__ __device__ void write_tiled_new(DTypeO* O, const TiledCopyO& tiled_copy_O,
+                                            const LayoutO& layout_O, const TileShapeO& tile_shape_O,
+                                            const RegTensorO& tOrO_final, int thread_idx, int qo_tile_idx,
+                                            int qo_head_idx, int qo_indptr, int64_t qo_len) {
+  Tensor mO = make_tensor(make_gmem_ptr(O + qo_indptr * stride<0>(layout_O)), layout_O);
+  Tensor gO =
+      get_local_tile_tensor(mO, tile_shape_O, qo_head_idx, 0, qo_len)(_, _, qo_tile_idx);  // (O, D)
+  Tensor cO = cute::make_identity_tensor(gO.shape());  // (O, D) -> (o_idx, d_idx)
+
+  ThrCopy thr_copy_O = tiled_copy_O.get_slice(thread_idx);
+  Tensor tOgO = thr_copy_O.partition_D(gO);  // (CPY, CPY_O, CPY_D)
+  Tensor tOcO = thr_copy_O.partition_D(cO);  // (CPY, CPY_O, CPY_D)
+  
+  // tOrO_final has S layout (from partition_S), but we need D layout for gmem write
+  // Create a register tensor matching the destination layout and copy data
+  Tensor tOrO_dest = make_fragment_like(tOgO);  // (CPY, CPY_O, CPY_D) - D layout
+  
+  // Copy data from tOrO_final (S layout) to tOrO_dest (D layout) using element-wise copy
+  // Flatten both to 1D for simple element-wise access
+  auto tOrO_final_flat = flatten(tOrO_final);
+  auto tOrO_dest_flat = flatten(tOrO_dest);
+  CUTE_STATIC_ASSERT_V(size(tOrO_final_flat) == size(tOrO_dest_flat));
+  CUTE_UNROLL
+  for (int i = 0; i < size(tOrO_dest_flat); ++i) {
+    tOrO_dest_flat(i) = tOrO_final_flat(i);
+  }
+  
+  Tensor tOrOGroup = flatten_1(tOrO_dest);  // (CPY, (CPY_O, CPY_D))
+  Tensor tOgOGroup = flatten_1(tOgO);        // (CPY, (CPY_O, CPY_D))
+  Tensor tOcOGroup = flatten_1(tOcO);        // (CPY, (CPY_O, CPY_D))
+
+  const int qo_tile_size = get<0>(tile_shape_O);
+  int valid_qo_tile_size = std::min<int>(qo_len - qo_tile_idx * qo_tile_size, qo_tile_size);
+  if (valid_qo_tile_size == qo_tile_size) {
+    // Copy from registers (tOrOGroup) to global memory (tOgOGroup)
+    copy(tiled_copy_O, tOrOGroup, tOgOGroup);
+  } else {
+    // copy if not out of bound
+    auto predicate_fn = [&](auto coords) {
+      auto s_coords = tOcOGroup(_0{}, coords);
+      return elem_less(get<0>(s_coords), valid_qo_tile_size);
+    };
+    copy_if(tiled_copy_O, predicate_fn, tOrOGroup, tOgOGroup);
+  }
+}
+
+template <int NUM_COPY_THREADS, typename ElemO, typename TiledCopyO, typename LayoutO,
+          typename TileShapeO, typename RegTensorO>
+__forceinline__ __device__ void write_O_new(ElemO* O, const TiledCopyO& tiled_copy_O,
+                                        const LayoutO& layout_O, const TileShapeO& tile_shape_O,
+                                        const RegTensorO& tOrO_final, int thread_idx, int qo_tile_idx,
+                                        int qo_head_idx, int qo_indptr, int qo_len,
+                                        int write_warp_idx) {
+  write_tiled_new<NUM_COPY_THREADS>(O, tiled_copy_O, layout_O, tile_shape_O, tOrO_final, thread_idx,
+                                qo_tile_idx, qo_head_idx, qo_indptr, qo_len);
+}
+
 template <typename Ktraits>
 struct CollectiveEpilogue {
   using DTypeO = typename Ktraits::DTypeO;
@@ -225,7 +284,7 @@ struct CollectiveEpilogue {
             typename TiledMma>
   CUTLASS_DEVICE void store_new(Params const& epilogue_params, FrgTensorO const& tOrO,
                             FrgTensorLSE const& lse, SharedStorage& shared_storage,
-                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord, const int clusterBlockRank = 0) {
+                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord, const int clusterBlockRank = 0, const int cluster_size = 1, const bool kvsplit_mode = false) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
@@ -284,7 +343,8 @@ struct CollectiveEpilogue {
       //will implement sync later.
       //read shared memory from cluster rank 1
       // sync on cluster rank 1
-
+      
+      if ((cluster_size > 1) && (kvsplit_mode)){
       cutlass::ConsumerToken barrier_token =
       static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_start.try_wait(0));
       if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
@@ -311,7 +371,61 @@ struct CollectiveEpilogue {
       
 
       shared_storage.barrier_r_end.arrive(static_cast<uint32_t>(1), 1UL);
+      
+      // Reduction operations: Add tOrO_1 (from peer CTA) with local tOrO
+      // tOrO_retile is already computed above and has the same layout as tOrO_1 (both S layout)
+      // Verify sizes match
+      CUTE_STATIC_ASSERT_V(size(tOrO_1) == size(tOrO_retile));
+      
+      // Create result tensor matching tOrO_1's layout
+      Tensor tOrO_final = make_fragment_like(tOrO_1);
+      
+      // Element-wise addition using flattening and integer indexing
+      // Flatten all tensors to 1D for simple element-wise access
+      auto tOrO_1_flat = flatten(tOrO_1);
+      auto tOrO_retile_flat = flatten(tOrO_retile);
+      auto tOrO_final_flat = flatten(tOrO_final);
+      
+      CUTE_STATIC_ASSERT_V(size(tOrO_1_flat) == size(tOrO_retile_flat));
+      CUTE_STATIC_ASSERT_V(size(tOrO_1_flat) == size(tOrO_final_flat));
+      
+      CUTE_UNROLL
+      for (int i = 0; i < size(tOrO_final_flat); ++i) {
+          tOrO_final_flat(i) = tOrO_1_flat(i) + tOrO_retile_flat(i);
+      }
+      
+      //printf("tOrO_final: %f\n", static_cast<float>(tOrO_final_flat(0)));
 
+
+      //printf("tOrO_final: %f\n", static_cast<float>(tOrO_final(0, 0, 0)));
+
+    
+
+      int write_warp_idx = NUM_WARPS - 1;
+      if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
+        cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+                                          cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+      }
+      TiledCopyO gmem_tiled_copy_O;
+      // Write tOrO_final (register tensor) directly to global memory
+      write_O_new<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
+                                    select<0, 1>(TileShape_PDV{}), tOrO_final, thread_idx, qo_tile_idx,
+                                    qo_head_idx, qo_indptr, qo_len, write_warp_idx);
+    }
+    else{
+
+      int write_warp_idx = NUM_WARPS - 1;
+      if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
+        cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+                                          cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+      }
+      TiledCopyO gmem_tiled_copy_O;
+      write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
+                                select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
+                                qo_head_idx, qo_indptr, qo_len, write_warp_idx);
+
+    }  
+      
 
 
 
