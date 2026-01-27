@@ -879,8 +879,27 @@ inline cudaError_t PrefillSM90Plan(
     idx_qo_kv_len_vec.push_back({i, qo_len, kv_len});
   }
 
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+  printf("\n--- idx_qo_kv_len_vec (BEFORE sorting) ---\n");
+  printf("batch_size=%zu\n", batch_size);
+  for (const auto& [idx, qo_len, kv_len] : idx_qo_kv_len_vec) {
+    printf("  [batch_idx=%d, qo_len=%d, kv_len=%d]\n", idx, qo_len, kv_len);
+  }
+#endif
+
   std::sort(idx_qo_kv_len_vec.begin(), idx_qo_kv_len_vec.end(),
-            [](const auto& a, const auto& b) { return std::get<2>(a) > std::get<2>(b); });
+            [](const auto& a, const auto& b) {
+              if (std::get<2>(a) != std::get<2>(b))
+                return std::get<2>(a) > std::get<2>(b);  // primary: kv_len descending
+              return std::get<0>(a) < std::get<0>(b);    // secondary: batch_idx ascending
+            });
+
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+  printf("\n--- idx_qo_kv_len_vec (AFTER sorting by kv_len descending) ---\n");
+  for (const auto& [idx, qo_len, kv_len] : idx_qo_kv_len_vec) {
+    printf("  [batch_idx=%d, qo_len=%d, kv_len=%d]\n", idx, qo_len, kv_len);
+  }
+#endif
   int cta_tile_q = 128;
   if (head_dim_vo == 64) {
     cta_tile_q = 192;
@@ -904,6 +923,17 @@ inline cudaError_t PrefillSM90Plan(
   int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
 
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+  printf("\n========== FLASHINFER LOAD BALANCING ==========\n");
+  printf("num_sms=%d, batch_size=%zu, cta_tile_q=%d\n", num_sm90_ctas, batch_size, cta_tile_q);
+  printf("Processing order (sorted by kv_len descending):\n");
+  for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
+    printf("  Batch %d: qo_len=%d, kv_len=%d, num_tiles=%d\n", i, qo_len, kv_len,
+           ceil_div(qo_len, cta_tile_q));
+  }
+  printf("\n--- Tile Assignment ---\n");
+#endif
+
   for (int qo_head_idx = 0;
        qo_head_idx < (plan_info.same_schedule_for_all_heads ? 1 : num_qo_heads); ++qo_head_idx) {
     for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
@@ -915,7 +945,13 @@ inline cudaError_t PrefillSM90Plan(
         int effective_kv_len =
             causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
                    : kv_len;
-        cta_cost_heap.insert({cta_idx, accum_cost + cost_function(cta_tile_q, effective_kv_len)});
+        float tile_cost = cost_function(cta_tile_q, effective_kv_len);
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+        printf("  Batch%d-Tile%d (qo_head=%d, eff_kv=%d, cost=%.1f) -> SM%d (prev_cost=%.1f, new_cost=%.1f)\n",
+               i, qo_tile_idx, qo_head_idx, effective_kv_len, tile_cost,
+               cta_idx, accum_cost, accum_cost + tile_cost);
+#endif
+        cta_cost_heap.insert({cta_idx, accum_cost + tile_cost});
         cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
         cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
         cta_qo_len[cta_idx].push_back(qo_len);
@@ -932,6 +968,27 @@ inline cudaError_t PrefillSM90Plan(
     work_indptr_vec[i + 1] = work_indptr_vec[i] + cta_qo_tile_indices[i].size();
   }
   int total_num_works = work_indptr_vec.back();
+
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+  printf("\n--- Final SM Assignment Summary ---\n");
+  printf("total_num_works=%d\n", total_num_works);
+  printf("work_indptr = [");
+  for (uint32_t i = 0; i <= num_sm90_ctas; ++i) {
+    printf("%d%s", work_indptr_vec[i], i < num_sm90_ctas ? ", " : "]\n");
+  }
+  for (uint32_t sm = 0; sm < num_sm90_ctas; ++sm) {
+    int num_tiles = cta_qo_tile_indices[sm].size();
+    if (num_tiles > 0) {
+      printf("SM%d (%d tiles): ", sm, num_tiles);
+      for (int t = 0; t < num_tiles; ++t) {
+        printf("Batch%d-Tile%d", cta_batch_indices[sm][t], cta_qo_tile_indices[sm][t]);
+        if (t < num_tiles - 1) printf(", ");
+      }
+      printf("\n");
+    }
+  }
+  printf("==============================================\n\n");
+#endif
   auto qo_tile_indices_vec = flatten(cta_qo_tile_indices, total_num_works);
   auto qo_indptr_vec = flatten(cta_qo_indptr, total_num_works);
   auto kv_indptr_vec = flatten(cta_kv_indptr, total_num_works);

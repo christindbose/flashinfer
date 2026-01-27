@@ -17,6 +17,7 @@
 #define FLASHINFER_ATTENTION_HEAP_H
 
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -41,12 +42,18 @@ class MinHeap {
   void insert(const Element& element) {
     heap_.push_back(element);
     std::push_heap(heap_.begin(), heap_.end(), compare);
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+    printf("[Heap] insert(SM%d, cost=%.1f)\n", element.first, element.second);
+#endif
   }
 
   Element pop() {
     std::pop_heap(heap_.begin(), heap_.end(), compare);
     Element minElement = heap_.back();
     heap_.pop_back();
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+    printf("[Heap] pop() -> SM%d (accumulated_cost=%.1f)\n", minElement.first, minElement.second);
+#endif
     return minElement;
   }
 
