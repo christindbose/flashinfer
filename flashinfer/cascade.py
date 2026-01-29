@@ -520,13 +520,20 @@ class MultiLevelCascadeAttentionWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: torch.Tensor,
+        tree_nodes: Optional[List[int]] = None,
     ):
         r"""Compute multi-level cascade attention.
 
         Parameters
         ----------
         q : torch.Tensor
-            The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``.
+            The query tensor. For fused tree mode with tree_nodes specified:
+            shape: ``[batch_size * num_tree_levels, num_qo_heads, head_dim]``
+            where batch_size = tree_nodes[-1] (number of leaf sequences).
+            
+            For simple 2-level mode (tree_nodes=None):
+            shape: ``[2 * batch_size, num_qo_heads, head_dim]``
+            
         paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
             The paged KV-Cache stored as a tuple of tensors or a single tensor:
 
@@ -540,17 +547,57 @@ class MultiLevelCascadeAttentionWrapper:
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
+              
+        tree_nodes : Optional[List[int]]
+            For fused tree attention: list of node counts at each level.
+            E.g., [1, 2, 64] means: 1 root node, 2 intermediate nodes, 64 leaf nodes.
+            The last element is the batch_size (number of sequences).
+            If None, assumes simple 2-level structure (shared + unique).
         """
-        out, lse = self._batch_prefill_wrappers[-1].run(
+        
+        # Run fused attention kernel
+        out, lse = self._batch_prefill_wrappers[0].run(
             q,
             paged_kv_cache,
             return_lse=True,
         )
-        for wrapper in self._batch_prefill_wrappers[:-1]:
-            out_i, lse_i = wrapper.run(q, paged_kv_cache, return_lse=True)
-            merge_state_in_place(out, lse, out_i, lse_i)
-
-        return out
+        
+        if tree_nodes is not None:
+            # Arbitrary tree structure merge
+            # Output layout: [level0_results..., level1_results..., level2_results...]
+            # Within each level, results are ordered by sequence ID (0, 1, 2, ..., batch_size-1)
+            # So level L output for seq_id is at index: batch_size * L + seq_id
+            
+            batch_size = tree_nodes[-1]
+            num_tree_levels = len(tree_nodes)
+            
+            # Initialize with level 0 results (root level - all seqs share)
+            merged_out = out[0:batch_size].clone()
+            merged_lse = lse[0:batch_size].clone()
+            
+            # Merge each subsequent level hierarchically
+            for level in range(1, num_tree_levels):
+                level_start = batch_size * level
+                level_end = batch_size * (level + 1)
+                level_out = out[level_start:level_end]
+                level_lse = lse[level_start:level_end]
+                merge_state_in_place(merged_out, merged_lse, level_out, level_lse)
+            
+            return merged_out
+        else:
+            # Simple 2-level structure (backward compatible)
+            # out[0:batch_size] = attention over shared KV for each sequence
+            # out[batch_size:2*batch_size] = attention over unique KV for each sequence
+            batch_size = out.shape[0] // 2
+            out_shared = out[:batch_size]
+            lse_shared = lse[:batch_size]
+            out_unique = out[batch_size:]
+            lse_unique = lse[batch_size:]
+            
+            # Merge shared and unique attention results using cascade reduction
+            merge_state_in_place(out_shared, lse_shared, out_unique, lse_unique)
+                    
+            return out_shared
 
     forward = run
 

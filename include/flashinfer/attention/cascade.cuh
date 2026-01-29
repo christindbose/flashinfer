@@ -90,6 +90,7 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
                                         uint32_t head_dim) {
   uint32_t pos = blockIdx.x;
 
+  //printf("pos: %d\n", pos);
   if (mask != nullptr && mask[pos] == 0) return;
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
