@@ -224,6 +224,7 @@ struct BatchPrefillTileScheduler {
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) {
+    //printf("num_sm: %d, args.num_qo_heads: %d\n", num_sm, args.num_qo_heads);
     return {(unsigned)num_sm, (unsigned)args.num_qo_heads};
   }
 

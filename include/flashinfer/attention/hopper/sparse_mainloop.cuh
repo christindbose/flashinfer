@@ -171,7 +171,7 @@ struct SparseCollectiveMainloop {
                            BlockCoord const& block_coord, int work_idx,
                            const int num_kv_tiles_outside_items_window = 0,
                            const int num_kv_tiles_prefix = 0, const int clusterBlockRank = 0,
-                           const int cluster_size = 1) {
+                           const int cluster_size = 1, const bool kvsplit_mode = false) {
 
     //printf("in load");
     int thread_idx = threadIdx.x;
@@ -201,24 +201,16 @@ struct SparseCollectiveMainloop {
     
     int kv_tiles_cluster = cute::ceil_div(num_kv_tiles, cluster_size);
     
-    int kv_start = kv_tiles_cluster * clusterBlockRank;
-    int kv_end = min(kv_start + kv_tiles_cluster - 1, num_kv_tiles - 1);
+    int kv_start = 0;
+    int kv_end = 0;
 
-    kv_tile_idx = kv_end;
-
-    //printf("num_kv_tiles: %d\n", num_kv_tiles);
-    //int kv_tile_idx = num_kv_tiles - 1;
-    //int tiles_per_cluster = num_kv_tiles / cluster_size;
-    //int kv_tile_idx = num_kv_tiles - clusterBlockRank - 1;
-    //int kv_tile_idx = num_kv_tiles - tiles_per_cluster * clusterBlockRank - 1;
-
-
-    /*
-    if (cluster_size > 1){
-      kv_tile_idx = num_kv_tiles - clusterBlockRank - 1;
+    if (kvsplit_mode){
+      kv_start = kv_tiles_cluster * clusterBlockRank;
+      kv_end = min(kv_start + kv_tiles_cluster - 1, num_kv_tiles - 1);
+      kv_tile_idx = kv_end;
     }
-    */
 
+    
     int swa_begin_kv_tile_idx = 0;
     if constexpr (LEFT_SLIDING_WINDOW) {
       swa_begin_kv_tile_idx = get_swa_begin_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,

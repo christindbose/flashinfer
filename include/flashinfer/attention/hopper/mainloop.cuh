@@ -160,7 +160,7 @@ struct CollectiveMainloop {
                            typename Scheduler::WorkTileInfo& work_tile_info,
                            BlockCoord const& block_coord, int work_idx, const int num_kv_tiles_outside_items_window = 0,
                            const int num_kv_tiles_prefix = 0, const int clusterBlockRank = 0,
-                           const int cluster_size = 1) {
+                           const int cluster_size = 1, const bool kvsplit_mode = false) {
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
     Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
