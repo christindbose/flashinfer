@@ -20,8 +20,11 @@
 #include <driver_types.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <sstream>
 #include <vector>
 
@@ -853,7 +856,8 @@ inline cudaError_t PrefillSM90Plan(
     PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
     uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
-    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream,
+    bool use_tree_walk_scheduling = false) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -887,12 +891,75 @@ inline cudaError_t PrefillSM90Plan(
   }
 #endif
 
-  std::sort(idx_qo_kv_len_vec.begin(), idx_qo_kv_len_vec.end(),
-            [](const auto& a, const auto& b) {
-              if (std::get<2>(a) != std::get<2>(b))
-                return std::get<2>(a) > std::get<2>(b);  // primary: kv_len descending
-              return std::get<0>(a) < std::get<0>(b);    // secondary: batch_idx ascending
-            });
+  if (use_tree_walk_scheduling) {
+    // Tree-based 2-level walk scheduling (assumes uniform/balanced trees):
+    // Infer tree structure from qo_indptr by grouping nodes with same qo_len
+    // Group nodes by qo_len to infer tree levels
+    printf("Using tree-based 2-level walk scheduling\n");
+    std::map<int, std::vector<int>> nodes_by_qo_len;
+    for (uint32_t i = 0; i < batch_size; ++i) {
+      int qo_len = qo_indptr_h[i + 1] - qo_indptr_h[i];
+      nodes_by_qo_len[qo_len].push_back(i);
+    }
+    
+    // Build tree structure: levels are ordered by decreasing qo_len (more sequences = higher level)
+    std::vector<std::vector<int>> tree_levels;
+    for (auto it = nodes_by_qo_len.rbegin(); it != nodes_by_qo_len.rend(); ++it) {
+      tree_levels.push_back(it->second);
+    }
+    
+    // Reorder idx_qo_kv_len_vec according to 2-level tree walk pattern:
+    // Process nodes in groups of 2 levels: parent, then its children, then neighbor
+    // Example: root, A, B, then C, s0, s1, then D, s2, s3, then E, s4, s5, then F, s6, s7
+    std::vector<std::tuple<int, int, int>> reordered_idx_qo_kv_len_vec;
+    
+    if (tree_levels.size() >= 2) {
+      // Process level 0 (root)
+      for (int node_idx : tree_levels[0]) {
+        reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[node_idx]);
+      }
+      
+      // Process level 1
+      for (int node_idx : tree_levels[1]) {
+        reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[node_idx]);
+      }
+      
+      // Process remaining levels in pairs: for each parent at level L, process it then its children at level L+1
+      // Assumes uniform tree: all parents at level L have the same number of children
+      for (size_t level = 2; level < tree_levels.size(); level += 2) {
+        // Process nodes at current level (parents)
+        for (size_t parent_idx = 0; parent_idx < tree_levels[level].size(); ++parent_idx) {
+          int parent_node_idx = tree_levels[level][parent_idx];
+          reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[parent_node_idx]);
+          
+          // Process children of this parent (if next level exists)
+          // Assumes uniform distribution: children_per_parent is the same for all parents
+          if (level + 1 < tree_levels.size()) {
+            int children_per_parent = tree_levels[level + 1].size() / tree_levels[level].size();
+            int child_start = parent_idx * children_per_parent;
+            int child_end = (parent_idx + 1) * children_per_parent;
+            
+            for (int child_idx = child_start; child_idx < child_end && 
+                 child_idx < (int)tree_levels[level + 1].size(); ++child_idx) {
+              int child_node_idx = tree_levels[level + 1][child_idx];
+              reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[child_node_idx]);
+            }
+          }
+        }
+      }
+      
+      // Replace original with reordered
+      idx_qo_kv_len_vec = reordered_idx_qo_kv_len_vec;
+    }
+  } else {
+    // Original scheduling: sort by kv_len descending, then batch_idx ascending
+    std::sort(idx_qo_kv_len_vec.begin(), idx_qo_kv_len_vec.end(),
+              [](const auto& a, const auto& b) {
+                if (std::get<2>(a) != std::get<2>(b))
+                  return std::get<2>(a) > std::get<2>(b);  // primary: kv_len descending
+                return std::get<0>(a) < std::get<0>(b);    // secondary: batch_idx ascending
+              });
+  }
 
 #ifdef FLASHINFER_DEBUG_SCHEDULER
   printf("\n--- idx_qo_kv_len_vec (AFTER sorting by kv_len descending) ---\n");
@@ -900,6 +967,39 @@ inline cudaError_t PrefillSM90Plan(
     printf("  [batch_idx=%d, qo_len=%d, kv_len=%d]\n", idx, qo_len, kv_len);
   }
 #endif
+
+  // Collect all tiles with their costs for debugging
+  std::vector<std::tuple<int, int, int, int, int, int, float>> all_tiles_with_cost;
+  // tuple: (batch_idx, qo_tile_idx, qo_len, kv_len, qo_indptr, kv_indptr, cost)
+  for (const auto& [idx, qo_len, kv_len] : idx_qo_kv_len_vec) {
+    int num_qo_tiles = ceil_div(qo_len, 128);  // Using cta_tile_q = 128 temporarily
+    for (int qo_tile_idx = 0; qo_tile_idx < num_qo_tiles; ++qo_tile_idx) {
+      // For non-causal or when causal, calculate effective kv_len
+      int effective_kv_len = causal 
+        ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, 128, num_qo_tiles, 1)
+        : kv_len;
+      float tile_cost = cost_function(128, effective_kv_len);
+      all_tiles_with_cost.push_back({idx, qo_tile_idx, qo_len, kv_len, 
+                                      int(qo_indptr_h[idx]), int(kv_indptr_h[idx]), tile_cost});
+    }
+  }
+
+  // Sort by cost descending
+  std::sort(all_tiles_with_cost.begin(), all_tiles_with_cost.end(),
+            [](const auto& a, const auto& b) {
+              return std::get<6>(a) > std::get<6>(b);  // cost descending
+            });
+
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+  printf("\n--- ALL TILES sorted by COST (descending) ---\n");
+  printf("Total tiles: %zu\n", all_tiles_with_cost.size());
+  for (const auto& [batch_idx, qo_tile_idx, qo_len, kv_len, qo_indptr, kv_indptr, cost] : all_tiles_with_cost) {
+    printf("  Batch%d-Tile%d: qo_len=%d, kv_len=%d, qo_indptr=%d, kv_indptr=%d, cost=%.1f\n",
+           batch_idx, qo_tile_idx, qo_len, kv_len, qo_indptr, kv_indptr, cost);
+  }
+  printf("================================================\n\n");
+#endif
+
   int cta_tile_q = 128;
   if (head_dim_vo == 64) {
     cta_tile_q = 192;
@@ -976,6 +1076,22 @@ inline cudaError_t PrefillSM90Plan(
   for (uint32_t i = 0; i <= num_sm90_ctas; ++i) {
     printf("%d%s", work_indptr_vec[i], i < num_sm90_ctas ? ", " : "]\n");
   }
+  
+  // Print final accumulated costs per SM from the heap
+  printf("\n--- Final Accumulated Cost Per SM ---\n");
+  float max_cost = 0.0f, min_cost = 1e9f, total_cost = 0.0f;
+  auto heap_state = cta_cost_heap.getHeap();
+  for (const auto& [sm_idx, cost] : heap_state) {
+    printf("SM%d: cost=%.1f (%d tiles)\n", sm_idx, cost, (int)cta_qo_tile_indices[sm_idx].size());
+    max_cost = std::max(max_cost, cost);
+    min_cost = std::min(min_cost, cost);
+    total_cost += cost;
+  }
+  printf("Cost stats: min=%.1f, max=%.1f, avg=%.1f, imbalance=%.2f%%\n",
+         min_cost, max_cost, total_cost / num_sm90_ctas, 
+         (max_cost - min_cost) / max_cost * 100.0f);
+  
+  printf("\n--- Tile Assignment Details ---\n");
   for (uint32_t sm = 0; sm < num_sm90_ctas; ++sm) {
     int num_tiles = cta_qo_tile_indices[sm].size();
     if (num_tiles > 0) {

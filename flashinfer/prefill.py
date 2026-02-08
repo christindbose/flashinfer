@@ -1539,6 +1539,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         block_tables: Optional[torch.Tensor] = None,
         max_token_per_sequence: Optional[int] = None,
         max_sequence_kv: Optional[int] = None,
+        use_tree_walk_scheduling: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1856,23 +1857,66 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     block_id += num_blocks_needed
 
         if self._cached_module is not None:
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_host,
-                paged_kv_indptr_host,
-                kv_lens_arr_host,
-                self._max_total_num_rows or total_num_rows,
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                page_size,
-                self.is_cuda_graph_enabled,
-                head_dim_qk,
-                head_dim_vo,
-                causal,
-            )
+            # For SM90 backend (fa3/trtllm-gen), pass use_tree_walk_scheduling flag
+            # Other backends will ignore it if not supported
+            try:
+                if self._backend == "fa3" or self._backend == "trtllm-gen":
+                    self._plan_info = self._cached_module.plan(
+                        self._float_workspace_buffer,
+                        self._int_workspace_buffer,
+                        self._pin_memory_int_workspace_buffer,
+                        qo_indptr_host,
+                        paged_kv_indptr_host,
+                        kv_lens_arr_host,
+                        self._max_total_num_rows or total_num_rows,
+                        batch_size,
+                        num_qo_heads,
+                        num_kv_heads,
+                        page_size,
+                        self.is_cuda_graph_enabled,
+                        head_dim_qk,
+                        head_dim_vo,
+                        causal,
+                        use_tree_walk_scheduling,
+                    )
+                else:
+                    # For other backends, call without the flag
+                    self._plan_info = self._cached_module.plan(
+                        self._float_workspace_buffer,
+                        self._int_workspace_buffer,
+                        self._pin_memory_int_workspace_buffer,
+                        qo_indptr_host,
+                        paged_kv_indptr_host,
+                        kv_lens_arr_host,
+                        self._max_total_num_rows or total_num_rows,
+                        batch_size,
+                        num_qo_heads,
+                        num_kv_heads,
+                        page_size,
+                        self.is_cuda_graph_enabled,
+                        head_dim_qk,
+                        head_dim_vo,
+                        causal,
+                    )
+            except TypeError:
+                # Fallback if backend doesn't support the flag
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_host,
+                    paged_kv_indptr_host,
+                    kv_lens_arr_host,
+                    self._max_total_num_rows or total_num_rows,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    head_dim_qk,
+                    head_dim_vo,
+                    causal,
+                )
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode

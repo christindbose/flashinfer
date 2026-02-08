@@ -45,7 +45,7 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal) {
+    int64_t head_dim_vo, bool causal, bool use_tree_walk_scheduling) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -62,7 +62,8 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
                       int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<IdType>(),
                       kv_indptr.data_ptr<IdType>(), kv_len_arr.data_ptr<IdType>(), total_num_rows,
                       batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
-                      causal, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
+                      causal, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream,
+                      use_tree_walk_scheduling);
 
   TORCH_CHECK(status == cudaSuccess,
               "PrefillSM90Plan failed with error: ", cudaGetErrorString(status));
