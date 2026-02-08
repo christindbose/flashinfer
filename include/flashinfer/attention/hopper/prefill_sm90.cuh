@@ -82,6 +82,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   static constexpr int CTA_KV = Ktraits::CTA_KV;
 
   bool kvsplit_mode = false;
+  bool mech2_mode = true;
 
 
 
@@ -149,6 +150,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     shared_storage.barrier_O.init(/*num_threads=*/1);
     shared_storage.barrier_r_start.init(/*num_threads=*/cluster_size * NUM_MMA_THREADS);
     shared_storage.barrier_r_end.init(/*num_threads=*/NUM_MMA_THREADS);
+    shared_storage.barrier_r_start_mech2.init(/*num_threads=*/1 * NUM_MMA_THREADS);
+    shared_storage.barrier_r_end_mech2.init(/*num_threads=*/cluster_size * NUM_MMA_THREADS);
     //printf("barrier_r initialized with num_threads: %d\n", cluster_size * NUM_MMA_THREADS);
   }
   // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
@@ -385,12 +388,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       }
       */
 
-       
+      /*
       if ((threadIdx.x == 128) || (threadIdx.x == 256)){
         printf("SMID: %d, warp_group_idx: %d, clusterBlockRank: %d, blockIdx.x: %d, blockIdx.y: %d, q_tile_idx: %d, qo_indptr: %d, qo_len: %d, kv_len: %d, num_kv_tiles: %d  \n", smid(), warp_group_idx, clusterBlockRank, blockIdx.x, blockIdx.y, q_tile_idx, qo_indptr, qo_len, kv_len, num_kv_tiles);
       }
-      
-      
+      */
 
       int swa_begin_kv_tile_idx = 0;
       int swa_end_kv_tile_idx = -1;
@@ -462,10 +464,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
 
 
-        if (kvsplit_mode){
+        if (kvsplit_mode) {
           collective_epilogue.store_new(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank, cluster_size, kvsplit_mode);
-        } else {
+        } else if (mech2_mode) {
+          collective_epilogue.store_new_mech2(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
+                                tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank, cluster_size, mech2_mode);
+        }
+        else {
           collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                       tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
         }
@@ -637,7 +643,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
 
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeClusterDimension;
-  attribute[0].val.clusterDim.x = 1; // Cluster size in X-dimension
+  attribute[0].val.clusterDim.x = 4; // Cluster size in X-dimension
   attribute[0].val.clusterDim.y = 1;
   attribute[0].val.clusterDim.z = 1;
   
