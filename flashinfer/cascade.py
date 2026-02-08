@@ -523,6 +523,7 @@ class MultiLevelCascadeAttentionWrapper:
         q: torch.Tensor,
         paged_kv_cache: torch.Tensor,
         tree_nodes: Optional[List[int]] = None,
+        merge_every_n_levels: int = 1,
     ):
         r"""Compute multi-level cascade attention.
 
@@ -555,6 +556,12 @@ class MultiLevelCascadeAttentionWrapper:
             E.g., [1, 2, 64] means: 1 root node, 2 intermediate nodes, 64 leaf nodes.
             The last element is the batch_size (number of sequences).
             If None, assumes simple 2-level structure (shared + unique).
+            
+        merge_every_n_levels : int
+            Controls which levels are merged. When set to 1 (default), all levels are merged.
+            When set to 2, only every 2nd level is merged (e.g., for a 4-level tree with levels
+            0,1,2,3, this will merge levels 1 and 3). Levels are 0-indexed, with level 0 being
+            the root level that is always used as the base.
         """
         
         # Run fused attention kernel
@@ -577,13 +584,17 @@ class MultiLevelCascadeAttentionWrapper:
             merged_out = out[0:batch_size].clone()
             merged_lse = lse[0:batch_size].clone()
             
-            # Merge each subsequent level hierarchically
+            # Merge levels based on merge_every_n_levels flag
+            # When merge_every_n_levels=1: merge all levels (1, 2, 3, ...)
+            # When merge_every_n_levels=2: merge every 2nd level (1, 3, 5, ...)
+            # When merge_every_n_levels=3: merge every 3rd level (1, 4, 7, ...)
             for level in range(1, num_tree_levels):
-                level_start = batch_size * level
-                level_end = batch_size * (level + 1)
-                level_out = out[level_start:level_end]
-                level_lse = lse[level_start:level_end]
-                merge_state_in_place(merged_out, merged_lse, level_out, level_lse)
+                if (level - 1) % merge_every_n_levels == 0:
+                    level_start = batch_size * level
+                    level_end = batch_size * (level + 1)
+                    level_out = out[level_start:level_end]
+                    level_lse = lse[level_start:level_end]
+                    merge_state_in_place(merged_out, merged_lse, level_out, level_lse)
             
             return merged_out
         else:
