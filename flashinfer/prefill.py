@@ -1540,6 +1540,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_token_per_sequence: Optional[int] = None,
         max_sequence_kv: Optional[int] = None,
         use_tree_walk_scheduling: bool = False,
+        kvsplit_mode: bool = False,
+        mech2_mode: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1878,6 +1880,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         head_dim_vo,
                         causal,
                         use_tree_walk_scheduling,
+                        kvsplit_mode,
+                        mech2_mode,
                     )
                 else:
                     # For other backends, call without the flag

@@ -67,6 +67,8 @@ struct RaggedParams {
   int window_left;
 
   bool causal;
+  bool kvsplit_mode = false;
+  bool mech2_mode = false;
 };
 
 struct PagedParams {
@@ -113,6 +115,8 @@ struct PagedParams {
   int window_left;
 
   bool causal;
+  bool kvsplit_mode = false;
+  bool mech2_mode = false;
 };
 
 {{ variant_decl }}

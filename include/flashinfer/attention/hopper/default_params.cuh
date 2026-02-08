@@ -110,6 +110,8 @@ struct BatchPrefillRaggedParams {
   int window_left;
 
   bool causal;
+  bool kvsplit_mode;
+  bool mech2_mode;
 };
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
@@ -161,6 +163,8 @@ struct BatchPrefillPagedParams {
   int window_left;
 
   bool causal;
+  bool kvsplit_mode;
+  bool mech2_mode;
 };
 
 }  // namespace flashinfer

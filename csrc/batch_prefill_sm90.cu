@@ -45,7 +45,8 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal, bool use_tree_walk_scheduling) {
+    int64_t head_dim_vo, bool causal, bool use_tree_walk_scheduling,
+    bool kvsplit_mode = false, bool mech2_mode = false) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -63,7 +64,7 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
                       kv_indptr.data_ptr<IdType>(), kv_len_arr.data_ptr<IdType>(), total_num_rows,
                       batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
                       causal, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream,
-                      use_tree_walk_scheduling);
+                      use_tree_walk_scheduling, kvsplit_mode, mech2_mode);
 
   TORCH_CHECK(status == cudaSuccess,
               "PrefillSM90Plan failed with error: ", cudaGetErrorString(status));
@@ -132,6 +133,8 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
         params.group_size = params.num_qo_heads / params.num_kv_heads;
         params.window_left = window_left;
         params.causal = mask_mode_code == 1;
+        params.kvsplit_mode = plan_info.kvsplit_mode;
+        params.mech2_mode = plan_info.mech2_mode;
         params.qo_tile_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
         params.qo_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_indptr_offset);
@@ -231,6 +234,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
         params.page_size = page_size;
         params.window_left = window_left;
         params.causal = mask_mode_code == 1;
+        params.kvsplit_mode = plan_info.kvsplit_mode;
+        params.mech2_mode = plan_info.mech2_mode;
         params.qo_tile_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
         params.qo_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_indptr_offset);

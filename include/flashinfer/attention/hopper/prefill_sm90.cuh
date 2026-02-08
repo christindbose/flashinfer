@@ -81,10 +81,10 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   static constexpr int CTA_Q = Ktraits::CTA_Q;
   static constexpr int CTA_KV = Ktraits::CTA_KV;
 
-  bool kvsplit_mode = false;
-  bool mech2_mode = true;
+  bool kvsplit_mode = scheduler_params.kvsplit_mode;
+  bool mech2_mode = scheduler_params.mech2_mode;
 
-
+  printf("kvsplit_mode: %d, mech2_mode: %d\n", kvsplit_mode, mech2_mode);
 
   static constexpr bool use_tma_load_kv = CollectiveMainloop::USE_TMA_LOAD_KV;
 
@@ -603,7 +603,9 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
       params.kv_lens,
       params.batch_indices,
       cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
-      params.num_qo_heads};
+      params.num_qo_heads,
+      params.kvsplit_mode,
+      params.mech2_mode};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.
@@ -709,7 +711,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
       params.kv_lens,
       params.batch_indices,
       cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
-      params.num_qo_heads};
+      params.num_qo_heads,
+      params.kvsplit_mode,
+      params.mech2_mode};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.

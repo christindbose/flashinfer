@@ -418,6 +418,8 @@ class MultiLevelCascadeAttentionWrapper:
         q_data_type: str = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         use_tree_walk_scheduling: bool = False,
+        kvsplit_mode: bool = False,
+        mech2_mode: bool = False,
     ):
         r"""Create auxiliary data structures for multi-level cascade attention for multiple
         forward calls within the same decode step. Please check
@@ -514,6 +516,8 @@ class MultiLevelCascadeAttentionWrapper:
                 q_data_type=q_data_type,
                 kv_data_type=kv_data_type,
                 use_tree_walk_scheduling=use_tree_walk_scheduling,
+                kvsplit_mode=kvsplit_mode,
+                mech2_mode=mech2_mode,
             )
 
     begin_forward = plan

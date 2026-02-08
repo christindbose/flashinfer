@@ -86,6 +86,8 @@ struct BatchPrefillPersistentTileScheduler {
         *kv_lens, *batch_indices;
     cutlass::FastDivmod group_size_fastdiv;
     int num_qo_heads;  // placeholder
+    bool kvsplit_mode;
+    bool mech2_mode;
   };
 
   // Device side kernel params
@@ -93,12 +95,15 @@ struct BatchPrefillPersistentTileScheduler {
     IdType *work_indptr, *head_indices, *qo_tile_indices, *qo_indptr, *kv_indptr, *qo_lens,
         *kv_lens, *batch_indices;
     cutlass::FastDivmod group_size_fastdiv;
+    bool kvsplit_mode;
+    bool mech2_mode;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
     return {args.work_indptr, args.head_indices,  args.qo_tile_indices,
             args.qo_indptr,   args.kv_indptr,     args.qo_lens,
-            args.kv_lens,     args.batch_indices, args.group_size_fastdiv};
+            args.kv_lens,     args.batch_indices, args.group_size_fastdiv,
+            args.kvsplit_mode, args.mech2_mode};
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) { return {(unsigned)num_sm}; }
@@ -207,6 +212,8 @@ struct BatchPrefillTileScheduler {
         *kv_lens, *batch_indices;  // head_indices is a placeholder
     cutlass::FastDivmod group_size_fastdiv;
     int num_qo_heads;
+    bool kvsplit_mode;
+    bool mech2_mode;
   };
 
   // Device side kernel params
@@ -215,12 +222,14 @@ struct BatchPrefillTileScheduler {
         *batch_indices;
     cutlass::FastDivmod group_size_fastdiv;
     int num_qo_heads;
+    bool kvsplit_mode;
+    bool mech2_mode;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
     return {args.work_indptr, args.qo_tile_indices, args.qo_indptr,     args.kv_indptr,
             args.qo_lens,     args.kv_lens,         args.batch_indices, args.group_size_fastdiv,
-            args.num_qo_heads};
+            args.num_qo_heads, args.kvsplit_mode, args.mech2_mode};
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) {

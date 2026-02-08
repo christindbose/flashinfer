@@ -811,6 +811,8 @@ struct PrefillPlanSM90Info {
   int64_t work_indptr_offset;
   int64_t batch_indices_offset;
   bool same_schedule_for_all_heads;
+  bool kvsplit_mode;
+  bool mech2_mode;
 
   PrefillPlanSM90Info()
       : qo_tile_indices_offset(0),
@@ -821,31 +823,51 @@ struct PrefillPlanSM90Info {
         head_indices_offset(0),
         work_indptr_offset(0),
         batch_indices_offset(0),
-        same_schedule_for_all_heads(false) {}
+        same_schedule_for_all_heads(false),
+        kvsplit_mode(false),
+        mech2_mode(false) {}
 
   // convert PrefillPlanSM90Info to std::vector<int64_t>
   std::vector<int64_t> ToVector() const {
     return {qo_tile_indices_offset, qo_indptr_offset,     kv_indptr_offset,
             qo_len_offset,          kv_len_offset,        head_indices_offset,
-            work_indptr_offset,     batch_indices_offset, same_schedule_for_all_heads};
+            work_indptr_offset,     batch_indices_offset, same_schedule_for_all_heads,
+            static_cast<int64_t>(kvsplit_mode), static_cast<int64_t>(mech2_mode)};
   }
 
   // From std::vector<int64_t> to PrefillPlanSM90Info
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 9) {
+    if (vec.size() == 9) {
+      // Backward compatibility: old format without flags
+      qo_tile_indices_offset = vec[0];
+      qo_indptr_offset = vec[1];
+      kv_indptr_offset = vec[2];
+      qo_len_offset = vec[3];
+      kv_len_offset = vec[4];
+      head_indices_offset = vec[5];
+      work_indptr_offset = vec[6];
+      batch_indices_offset = vec[7];
+      same_schedule_for_all_heads = vec[8];
+      kvsplit_mode = false;
+      mech2_mode = false;
+    } else if (vec.size() == 11) {
+      // New format with flags
+      qo_tile_indices_offset = vec[0];
+      qo_indptr_offset = vec[1];
+      kv_indptr_offset = vec[2];
+      qo_len_offset = vec[3];
+      kv_len_offset = vec[4];
+      head_indices_offset = vec[5];
+      work_indptr_offset = vec[6];
+      batch_indices_offset = vec[7];
+      same_schedule_for_all_heads = vec[8];
+      kvsplit_mode = static_cast<bool>(vec[9]);
+      mech2_mode = static_cast<bool>(vec[10]);
+    } else {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, but got " << vec.size();
+      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9 or 11, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
-    qo_tile_indices_offset = vec[0];
-    qo_indptr_offset = vec[1];
-    kv_indptr_offset = vec[2];
-    qo_len_offset = vec[3];
-    kv_len_offset = vec[4];
-    head_indices_offset = vec[5];
-    work_indptr_offset = vec[6];
-    batch_indices_offset = vec[7];
-    same_schedule_for_all_heads = vec[8];
   }
 };
 
@@ -857,7 +879,7 @@ inline cudaError_t PrefillSM90Plan(
     uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream,
-    bool use_tree_walk_scheduling = false) {
+    bool use_tree_walk_scheduling = false, bool kvsplit_mode = false, bool mech2_mode = false) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -1022,6 +1044,8 @@ inline cudaError_t PrefillSM90Plan(
 
   int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
+  plan_info.kvsplit_mode = kvsplit_mode;
+  plan_info.mech2_mode = mech2_mode;
 
 #ifdef FLASHINFER_DEBUG_SCHEDULER
   printf("\n========== FLASHINFER LOAD BALANCING ==========\n");
