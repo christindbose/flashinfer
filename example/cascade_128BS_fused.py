@@ -167,6 +167,7 @@ wrapper.plan(
     num_kv_heads,
     head_dim,
     page_size,
+    use_tree_walk_scheduling=True,
 )
 print("Finished planning fused cascade attention (combined level)")
 
@@ -181,10 +182,21 @@ for i in range(num_layers):
     outputs.append(o)
 
 print(f"\nOutput shape: {outputs[0].shape}")
+
 print(f"Output[0,0,0] (shared attention result): {outputs[0][0, 0, 0].item():.6f}")
-print(f"Output[{batch_size},0,0] (unique attention for seq 0): {outputs[0][batch_size, 0, 0].item():.6f}")
+#print(f"Output[{batch_size},0,0] (unique attention for seq 0): {outputs[0][batch_size, 0, 0].item():.6f}")
+
+
+"""
+# Print all unique context attention results
+print(f"\nAll unique context attention outputs (indices {batch_size} to {2*batch_size - 1}):")
+for seq_idx in range(batch_size):
+    output_idx = batch_size + seq_idx
+    print(f"  Seq {seq_idx}: Output[{output_idx},0,0] = {outputs[0][output_idx, 0, 0].item():.6f}")
+
 print("\nDone! Fused cascade attention (combined level, shared stored once) completed.")
 
+"""
 # Note: This stores shared pages once, but outputs are separate:
 # - outputs[0:batch_size]: attention over shared KV only
 # - outputs[batch_size:2*batch_size]: attention over unique KV per sequence

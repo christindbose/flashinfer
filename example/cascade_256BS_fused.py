@@ -45,7 +45,16 @@ unique_kv_pages_per_seq = args.unique_kv_pages_per_seq
 total_unique_pages = batch_size * unique_kv_pages_per_seq
 total_num_pages = shared_kv_num_pages + total_unique_pages
 
-print(f"Configuration:")
+# Get GPU SM info
+device = torch.cuda.current_device()
+num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+gpu_name = torch.cuda.get_device_properties(device).name
+
+print(f"GPU Info:")
+print(f"  Device: {gpu_name}")
+print(f"  Total SMs: {num_sms}")
+
+print(f"\nConfiguration:")
 print(f"  Batch size: {batch_size}")
 print(f"  Shared KV pages: {shared_kv_num_pages} ({shared_kv_num_pages * page_size} tokens)")
 print(f"  Unique KV pages per seq: {unique_kv_pages_per_seq} ({unique_kv_pages_per_seq * page_size} tokens)")
@@ -126,6 +135,27 @@ print(f"  combined_kv_page_indices shape: {combined_kv_page_indices.shape}")
 print(f"  combined_kv_page_indptr shape: {combined_kv_page_indptr.shape} (batch_size + 2 = {batch_size + 2})")
 print(f"  qo_indptr shape: {qo_indptr.shape} (batch_size + 2 = {batch_size + 2})")
 print(f"  Number of KV groups: {len(combined_kv_page_indptr) - 1} (1 shared + {batch_size} unique)")
+
+# SM utilization analysis
+num_kv_groups = len(combined_kv_page_indptr) - 1  # batch_size + 1 groups
+total_queries = 2 * batch_size
+num_blocks_per_sm = 2  # typical for prefill kernels
+
+# For prefill with paged KV: grid is typically (num_sm, num_qo_heads) or work-based
+max_grid_size = num_blocks_per_sm * num_sms
+
+# Estimate work items (depends on scheduler, this is approximate)
+# Each KV group with queries creates work
+estimated_work_items = num_kv_groups * num_qo_heads
+
+print(f"\nSM Utilization Analysis:")
+print(f"  Total SMs available: {num_sms}")
+print(f"  Max grid size (blocks_per_sm * num_sm): {max_grid_size}")
+print(f"  Number of KV groups: {num_kv_groups}")
+print(f"  Total queries: {total_queries}")
+print(f"  Estimated work items: {estimated_work_items}")
+print(f"  Work items per SM: {estimated_work_items / num_sms:.2f}")
+print(f"  SM saturation: {'YES' if estimated_work_items >= num_sms else 'NO (may need split KV)'}")
 
 # Plan the attention (single level with combined KV)
 wrapper.plan(
