@@ -519,6 +519,8 @@ class MultiLevelCascadeAttentionWrapper:
                 kvsplit_mode=kvsplit_mode,
                 mech2_mode=mech2_mode,
             )
+    
+
 
     begin_forward = plan
 
@@ -574,7 +576,11 @@ class MultiLevelCascadeAttentionWrapper:
             paged_kv_cache,
             return_lse=True,
         )
+        #print(f"merge_every_n_levels: {merge_every_n_levels}")
+
+
         
+
         if tree_nodes is not None:
             # Arbitrary tree structure merge
             # Output layout: [level0_results..., level1_results..., level2_results...]
@@ -584,20 +590,28 @@ class MultiLevelCascadeAttentionWrapper:
             batch_size = tree_nodes[-1]
             num_tree_levels = len(tree_nodes)
             
-            # Initialize with level 0 results (root level - all seqs share)
-            merged_out = out[0:batch_size].clone()
-            merged_lse = lse[0:batch_size].clone()
-            
-            # Merge levels based on merge_every_n_levels flag
-            # When merge_every_n_levels=1: merge all levels (1, 2, 3, ...)
-            # When merge_every_n_levels=2: merge every 2nd level (1, 3, 5, ...)
-            # When merge_every_n_levels=3: merge every 3rd level (1, 4, 7, ...)
-            for level in range(1, num_tree_levels):
-                if (level - 1) % merge_every_n_levels == 0:
-                    level_start = batch_size * level
-                    level_end = batch_size * (level + 1)
-                    level_out = out[level_start:level_end]
-                    level_lse = lse[level_start:level_end]
+            # Merge selected levels based on merge_every_n_levels flag
+            # Skip the first (merge_every_n_levels - 1) levels, then merge every Nth:
+            # When merge_every_n_levels=1: merge levels 0, 1, 2, 3, ... (all levels)
+            # When merge_every_n_levels=2: merge levels 1, 3, 5, ...
+            # When merge_every_n_levels=3: merge levels 2, 5, 8, ...
+            merged_out = None
+            merged_lse = None
+            start_level = merge_every_n_levels - 1
+            for level in range(start_level, num_tree_levels, merge_every_n_levels):
+                level_start = batch_size * level
+                level_end = batch_size * (level + 1)
+                level_out = out[level_start:level_end]
+                level_lse = lse[level_start:level_end]
+                if merged_out is None:
+                    merged_out = level_out.clone()
+                    merged_lse = level_lse.clone()
+                else:
+                    print(f"merging level {level} with shape {level_out.shape}")
+                    print(f"merged_out shape: {merged_out.shape}")
+                    print(f"merged_lse shape: {merged_lse.shape}")
+                    print(f"level_out shape: {level_out.shape}")
+                    print(f"level_lse shape: {level_lse.shape}")
                     merge_state_in_place(merged_out, merged_lse, level_out, level_lse)
             
             return merged_out
@@ -612,9 +626,13 @@ class MultiLevelCascadeAttentionWrapper:
             lse_unique = lse[batch_size:]
             
             # Merge shared and unique attention results using cascade reduction
+            
             merge_state_in_place(out_shared, lse_shared, out_unique, lse_unique)
                     
             return out_shared
+        
+        
+        return out
 
     forward = run
 

@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   bool kvsplit_mode = scheduler_params.kvsplit_mode;
   bool mech2_mode = scheduler_params.mech2_mode;
 
-  printf("kvsplit_mode: %d, mech2_mode: %d\n", kvsplit_mode, mech2_mode);
+  //printf("kvsplit_mode: %d, mech2_mode: %d\n", kvsplit_mode, mech2_mode);
 
   static constexpr bool use_tma_load_kv = CollectiveMainloop::USE_TMA_LOAD_KV;
 
@@ -468,13 +468,38 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           collective_epilogue.store_new(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank, cluster_size, kvsplit_mode);
         } else if (mech2_mode) {
+          
+          uint32_t start_mech2 = 0, stop_mech2 = 0;
+          if ((threadIdx.x == 128) || (threadIdx.x == 256) || (blockIdx.x == 0) || (blockIdx.y == 0) || (blockIdx.z == 0)){          
+          asm volatile("mov.u32 %0, %%clock;" : "=r"(start_mech2)::"memory");
+          }
           collective_epilogue.store_new_mech2(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank, cluster_size, mech2_mode);
-        }
+          
+          if ((threadIdx.x == 128) || (threadIdx.x == 256) || (blockIdx.x == 0) || (blockIdx.y == 0) || (blockIdx.z == 0)){
+          
+          asm volatile("mov.u32 %0, %%clock;" : "=r"(stop_mech2)::"memory");
+          float mech2_elapsed_time = (stop_mech2 - start_mech2) / 1000.0f;
+          //printf("mech2 elapsed time: %f ms\n", mech2_elapsed_time);
+        } }
+
         else {
+          
+          uint32_t start_baseline = 0, stop_baseline = 0;
+          if ((threadIdx.x == 128) || (threadIdx.x == 256) || (blockIdx.x == 0) || (blockIdx.y == 0) || (blockIdx.z == 0)){          
+          asm volatile("mov.u32 %0, %%clock;" : "=r"(start_baseline)::"memory");
+          }
+
           collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                       tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
-        }
+
+          if ((threadIdx.x == 128) || (threadIdx.x == 256) || (blockIdx.x == 0) || (blockIdx.y == 0) || (blockIdx.z == 0)){
+          asm volatile("mov.u32 %0, %%clock;" : "=r"(stop_baseline)::"memory");
+          float baseline_elapsed_time = (stop_baseline - start_baseline) / 1000.0f;
+          //printf("baseline elapsed time: %f ms\n", baseline_elapsed_time);
+          } 
+        } 
+
           //collective_epilogue.store(epilogue_params, tOrO_1, attention_updater.get_lse(), shared_storage,
           //                      tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
       //__syncthreads();
@@ -747,7 +772,9 @@ constexpr auto getCTATileSize() {
       if constexpr (CAUSAL) {
         return std::make_tuple(128, 128);
       } else {
+
         return std::make_tuple(128, 192);
+        //return std::make_tuple(64, 64);
       }
     } else {
       return std::make_tuple(128, 64);
@@ -826,8 +853,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
     } else if constexpr (HEAD_DIM_VO == 128) {
       BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
-                                /*CTA_Q_=*/128,
-                                /*CTA_KV_=*/96,
+                                /*CTA_Q_=*/128, //128
+                                /*CTA_KV_=*/96,//96
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
