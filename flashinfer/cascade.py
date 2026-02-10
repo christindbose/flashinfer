@@ -607,11 +607,11 @@ class MultiLevelCascadeAttentionWrapper:
                     merged_out = level_out.clone()
                     merged_lse = level_lse.clone()
                 else:
-                    print(f"merging level {level} with shape {level_out.shape}")
-                    print(f"merged_out shape: {merged_out.shape}")
-                    print(f"merged_lse shape: {merged_lse.shape}")
-                    print(f"level_out shape: {level_out.shape}")
-                    print(f"level_lse shape: {level_lse.shape}")
+                    #print(f"merging level {level} with shape {level_out.shape}")
+                    #print(f"merged_out shape: {merged_out.shape}")
+                    #print(f"merged_lse shape: {merged_lse.shape}")
+                    #print(f"level_out shape: {level_out.shape}")
+                    #print(f"level_lse shape: {level_lse.shape}")
                     merge_state_in_place(merged_out, merged_lse, level_out, level_lse)
             
             return merged_out
@@ -632,7 +632,7 @@ class MultiLevelCascadeAttentionWrapper:
             return out_shared
         
         
-        return out
+        #return out
 
     forward = run
 
