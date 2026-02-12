@@ -114,7 +114,7 @@ CUTLASS_DEVICE void mma_f16(
     if (cutlass::canonical_warp_idx_sync() == Ktraits::NUM_WARPS - 1 && lane_predicate) {
 #pragma unroll
       for (uint32_t cta_id = 0; cta_id < 1; ++cta_id) {
-        shared_storage.barrier_O.arrive(cta_id, lane_predicate);
+        shared_storage.barrier_O.arrive(clusterBlockRank, lane_predicate);
       }
     }
   }
