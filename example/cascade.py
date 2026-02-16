@@ -32,6 +32,7 @@ wrapper = flashinfer.MultiLevelCascadeAttentionWrapper(
     2, workspace_buffer, "NHD",
 )
 batch_size = 7
+use_baseline = True  # True: non-fused cascade, q shape [batch_size, ...]; False: fused, q shape [2*batch_size, ...]
 shared_kv_num_pages = 512
 unique_kv_num_pages = 128 #256 #128
 total_num_pages = shared_kv_num_pages + unique_kv_num_pages
@@ -74,7 +75,7 @@ for i in range(num_layers):
     #print(f"running layer {i}")
     q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
     # compute batch decode attention, reuse auxiliary data structures for all layers
-    o = wrapper.run(q, kv_cache_at_layer[i])
+    o = wrapper.run(q, kv_cache_at_layer[i], baseline=True)
     outputs.append(o)
 
 print(outputs[0].shape)
@@ -83,7 +84,7 @@ print(outputs[0].shape)
 
 
 t, _, _ = triton.testing.do_bench(
-    lambda: wrapper.run(q, kv_cache_at_layer[0]),
+    lambda: wrapper.run(q, kv_cache_at_layer[0], baseline=True),
     quantiles=[0.5, 0.2, 0.8],
     warmup=1
 )
@@ -103,7 +104,7 @@ for i in range(num_layers):
     #print(f"running layer {i}")
     q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
     # compute batch decode attention, reuse auxiliary data structures for all layers
-    o = wrapper.run(q, kv_cache_at_layer[i])
+    o = wrapper.run(q, kv_cache_at_layer[i], baseline=True)
     outputs2.append(o)
 
 # get end time

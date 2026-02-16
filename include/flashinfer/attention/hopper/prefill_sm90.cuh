@@ -670,7 +670,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
 
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeClusterDimension;
-  attribute[0].val.clusterDim.x = 4; // Cluster size in X-dimension
+  attribute[0].val.clusterDim.x = 2; // Cluster size in X-dimension
   attribute[0].val.clusterDim.y = 1;
   attribute[0].val.clusterDim.z = 1;
   

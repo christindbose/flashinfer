@@ -530,18 +530,18 @@ class MultiLevelCascadeAttentionWrapper:
         paged_kv_cache: torch.Tensor,
         tree_nodes: Optional[List[int]] = None,
         merge_every_n_levels: int = 1,
+        baseline: bool = False,
     ):
         r"""Compute multi-level cascade attention.
 
         Parameters
         ----------
         q : torch.Tensor
-            The query tensor. For fused tree mode with tree_nodes specified:
-            shape: ``[batch_size * num_tree_levels, num_qo_heads, head_dim]``
-            where batch_size = tree_nodes[-1] (number of leaf sequences).
-            
-            For simple 2-level mode (tree_nodes=None):
-            shape: ``[2 * batch_size, num_qo_heads, head_dim]``
+            The query tensor. When :attr:`baseline` is True, q is not fused: shape
+            ``[batch_size, num_qo_heads, head_dim]``; the same q is used for all levels.
+            When :attr:`baseline` is False: for fused tree mode with tree_nodes specified,
+            shape ``[batch_size * num_tree_levels, num_qo_heads, head_dim]``; for simple
+            2-level mode (tree_nodes=None), shape ``[2 * batch_size, num_qo_heads, head_dim]``.
             
         paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
             The paged KV-Cache stored as a tuple of tensors or a single tensor:
@@ -567,19 +567,32 @@ class MultiLevelCascadeAttentionWrapper:
             Controls which levels are merged. When set to 1 (default), all levels are merged.
             When set to 2, only every 2nd level is merged (e.g., for a 4-level tree with levels
             0,1,2,3, this will merge levels 1 and 3). Levels are 0-indexed, with level 0 being
-            the root level that is always used as the base.
+            the root level that is always used as the base. Ignored when :attr:`baseline` is True.
+            
+        baseline : bool
+            When True, use the non-fused cascade implementation: the same q (not fused,
+            shape ``[batch_size, num_qo_heads, head_dim]``) is passed to each level; each
+            level's attention is run separately and results are merged (last level first).
+            Use for baseline / comparison runs. Default is False.
         """
-        
-        # Run fused attention kernel
+        if baseline:
+            # Non-fused cascade: same q (not fused) passed to each level; run each wrapper, then merge (last level first).
+            out, lse = self._batch_prefill_wrappers[-1].run(
+                q, paged_kv_cache, return_lse=True
+            )
+            for i in range(self._num_levels - 1):
+                out_i, lse_i = self._batch_prefill_wrappers[i].run(
+                    q, paged_kv_cache, return_lse=True
+                )
+                merge_state_in_place(out, lse, out_i, lse_i)
+            return out
+
+        # Fused path: single kernel run, then merge selected levels in Python
         out, lse = self._batch_prefill_wrappers[0].run(
             q,
             paged_kv_cache,
             return_lse=True,
         )
-        #print(f"merge_every_n_levels: {merge_every_n_levels}")
-
-
-        
 
         if tree_nodes is not None:
             # Arbitrary tree structure merge
@@ -590,15 +603,17 @@ class MultiLevelCascadeAttentionWrapper:
             batch_size = tree_nodes[-1]
             num_tree_levels = len(tree_nodes)
             
-            # Merge selected levels based on merge_every_n_levels flag
-            # Skip the first (merge_every_n_levels - 1) levels, then merge every Nth:
-            # When merge_every_n_levels=1: merge levels 0, 1, 2, 3, ... (all levels)
-            # When merge_every_n_levels=2: merge levels 1, 3, 5, ...
-            # When merge_every_n_levels=3: merge levels 2, 5, 8, ...
+            # Merge selected levels. When baseline=True, merge all levels (start=0, step=1).
+            # Otherwise use merge_every_n_levels: skip first (merge_every_n_levels - 1) levels,
+            # then merge every Nth (e.g. merge_every_n_levels=2 -> levels 1, 3, 5, ...).
             merged_out = None
             merged_lse = None
-            start_level = merge_every_n_levels - 1
-            for level in range(start_level, num_tree_levels, merge_every_n_levels):
+            if baseline:
+                start_level, step = 0, 1
+            else:
+                start_level = merge_every_n_levels - 1
+                step = merge_every_n_levels
+            for level in range(start_level, num_tree_levels, step):
                 level_start = batch_size * level
                 level_end = batch_size * (level + 1)
                 level_out = out[level_start:level_end]
