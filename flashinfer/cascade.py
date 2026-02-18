@@ -481,6 +481,7 @@ class MultiLevelCascadeAttentionWrapper:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         """
+        self._mech2_mode = mech2_mode
         for i, (
             wrapper,
             qo_indptr,
@@ -577,10 +578,13 @@ class MultiLevelCascadeAttentionWrapper:
         """
         if baseline:
             # Non-fused cascade: same q (not fused) passed to each level; run each wrapper, then merge (last level first).
+            #print(f"running non-fused cascade with baseline=True")
             out, lse = self._batch_prefill_wrappers[-1].run(
                 q, paged_kv_cache, return_lse=True
             )
+            #print(f"finished running last level")
             for i in range(self._num_levels - 1):
+                #print(f"running level {i}")
                 out_i, lse_i = self._batch_prefill_wrappers[i].run(
                     q, paged_kv_cache, return_lse=True
                 )
@@ -594,6 +598,7 @@ class MultiLevelCascadeAttentionWrapper:
             return_lse=True,
         )
 
+        
         if tree_nodes is not None:
             # Arbitrary tree structure merge
             # Output layout: [level0_results..., level1_results..., level2_results...]
@@ -619,31 +624,27 @@ class MultiLevelCascadeAttentionWrapper:
                 level_out = out[level_start:level_end]
                 level_lse = lse[level_start:level_end]
                 if merged_out is None:
-                    merged_out = level_out.clone()
-                    merged_lse = level_lse.clone()
+                    # Use first level's slice as in-place merge target (no clone)
+                    merged_out = level_out
+                    merged_lse = level_lse
                 else:
-                    #print(f"merging level {level} with shape {level_out.shape}")
-                    #print(f"merged_out shape: {merged_out.shape}")
-                    #print(f"merged_lse shape: {merged_lse.shape}")
-                    #print(f"level_out shape: {level_out.shape}")
-                    #print(f"level_lse shape: {level_lse.shape}")
                     merge_state_in_place(merged_out, merged_lse, level_out, level_lse)
-            
+
             return merged_out
         else:
             # Simple 2-level structure (backward compatible)
             # out[0:batch_size] = attention over shared KV for each sequence
             # out[batch_size:2*batch_size] = attention over unique KV for each sequence
             batch_size = out.shape[0] // 2
+            if getattr(self, "_mech2_mode", False):
+                #print(f"running mech2 mode")
+                return out[batch_size:]
             out_shared = out[:batch_size]
             lse_shared = lse[:batch_size]
             out_unique = out[batch_size:]
             lse_unique = lse[batch_size:]
-            
             # Merge shared and unique attention results using cascade reduction
-            
             merge_state_in_place(out_shared, lse_shared, out_unique, lse_unique)
-                    
             return out_shared
         
         
