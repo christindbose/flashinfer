@@ -461,7 +461,7 @@ struct CollectiveEpilogue {
       shared_storage.barrier_r_start.arrive();
       //printf("arrive on cluster rank 0 SM id: %u\n", smid());
     }
-    if (clusterBlockRank == 1){
+    else {
       shared_storage.barrier_r_start.arrive(static_cast<uint32_t>(0), 1UL);
       //printf("arrive on cluster rank 1 SM id: %u\n", smid());
     }
@@ -500,7 +500,10 @@ struct CollectiveEpilogue {
       //printf("tOrO_1: %f\n", static_cast<float>(tOrO_1(0, 0, 0)));
       
 
-      shared_storage.barrier_r_end.arrive(static_cast<uint32_t>(1), 1UL);
+      for (int i = 1; i < cluster_size; i++){
+        shared_storage.barrier_r_end.arrive(static_cast<uint32_t>(i), 1UL);
+      }
+      //shared_storage.barrier_r_end.arrive(static_cast<uint32_t>(1), 1UL);
       
       // Reduction operations: Add tOrO_1 (from peer CTA) with local tOrO
       // tOrO_retile is already computed above and has the same layout as tOrO_1 (both S layout)

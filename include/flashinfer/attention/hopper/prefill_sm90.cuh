@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   bool kvsplit_mode = scheduler_params.kvsplit_mode;
   bool mech2_mode = scheduler_params.mech2_mode;
 
-  //printf("kvsplit_mode: %d, mech2_mode: %d\n", kvsplit_mode, mech2_mode);
+  //printf("SMID: %d, kvsplit_mode: %d, mech2_mode: %d\n", smid(), kvsplit_mode, mech2_mode);
 
   static constexpr bool use_tma_load_kv = CollectiveMainloop::USE_TMA_LOAD_KV;
 
@@ -670,7 +670,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
 
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeClusterDimension;
-  attribute[0].val.clusterDim.x = 2; // Cluster size in X-dimension
+  attribute[0].val.clusterDim.x = 4; // Cluster size in X-dimension
   attribute[0].val.clusterDim.y = 1;
   attribute[0].val.clusterDim.z = 1;
   
