@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <sstream>
 #include <vector>
 
@@ -810,6 +811,7 @@ struct PrefillPlanSM90Info {
   int64_t head_indices_offset;
   int64_t work_indptr_offset;
   int64_t batch_indices_offset;
+  int64_t cta_mech_mode_offset;
   bool same_schedule_for_all_heads;
   bool kvsplit_mode;
   bool mech2_mode;
@@ -823,6 +825,7 @@ struct PrefillPlanSM90Info {
         head_indices_offset(0),
         work_indptr_offset(0),
         batch_indices_offset(0),
+        cta_mech_mode_offset(0),
         same_schedule_for_all_heads(false),
         kvsplit_mode(false),
         mech2_mode(false) {}
@@ -831,7 +834,8 @@ struct PrefillPlanSM90Info {
   std::vector<int64_t> ToVector() const {
     return {qo_tile_indices_offset, qo_indptr_offset,     kv_indptr_offset,
             qo_len_offset,          kv_len_offset,        head_indices_offset,
-            work_indptr_offset,     batch_indices_offset, same_schedule_for_all_heads,
+            work_indptr_offset,     batch_indices_offset, cta_mech_mode_offset,
+            same_schedule_for_all_heads,
             static_cast<int64_t>(kvsplit_mode), static_cast<int64_t>(mech2_mode)};
   }
 
@@ -848,10 +852,11 @@ struct PrefillPlanSM90Info {
       work_indptr_offset = vec[6];
       batch_indices_offset = vec[7];
       same_schedule_for_all_heads = vec[8];
+      cta_mech_mode_offset = 0;
       kvsplit_mode = false;
       mech2_mode = false;
     } else if (vec.size() == 11) {
-      // New format with flags
+      // Format with kvsplit/mech2 flags, no per-CTA mech
       qo_tile_indices_offset = vec[0];
       qo_indptr_offset = vec[1];
       kv_indptr_offset = vec[2];
@@ -863,9 +868,25 @@ struct PrefillPlanSM90Info {
       same_schedule_for_all_heads = vec[8];
       kvsplit_mode = static_cast<bool>(vec[9]);
       mech2_mode = static_cast<bool>(vec[10]);
+      cta_mech_mode_offset = 0;
+    } else if (vec.size() == 12) {
+      // New format with per-CTA mech array offset
+      qo_tile_indices_offset = vec[0];
+      qo_indptr_offset = vec[1];
+      kv_indptr_offset = vec[2];
+      qo_len_offset = vec[3];
+      kv_len_offset = vec[4];
+      head_indices_offset = vec[5];
+      work_indptr_offset = vec[6];
+      batch_indices_offset = vec[7];
+      cta_mech_mode_offset = vec[8];
+      same_schedule_for_all_heads = vec[9];
+      kvsplit_mode = static_cast<bool>(vec[10]);
+      mech2_mode = static_cast<bool>(vec[11]);
     } else {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9 or 11, but got " << vec.size();
+      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, 11 or 12, but got "
+              << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
   }
@@ -917,7 +938,7 @@ inline cudaError_t PrefillSM90Plan(
     // Tree-based 2-level walk scheduling (assumes uniform/balanced trees):
     // Infer tree structure from qo_indptr by grouping nodes with same qo_len
     // Group nodes by qo_len to infer tree levels
-    printf("Using tree-based 2-level walk scheduling\n");
+    //printf("Using tree-based 2-level walk scheduling\n");
     std::map<int, std::vector<int>> nodes_by_qo_len;
     for (uint32_t i = 0; i < batch_size; ++i) {
       int qo_len = qo_indptr_h[i + 1] - qo_indptr_h[i];
@@ -930,47 +951,49 @@ inline cudaError_t PrefillSM90Plan(
       tree_levels.push_back(it->second);
     }
     
-    // Reorder idx_qo_kv_len_vec according to 2-level tree walk pattern:
-    // Process nodes in groups of 2 levels: parent, then its children, then neighbor
-    // Example: root, A, B, then C, s0, s1, then D, s2, s3, then E, s4, s5, then F, s6, s7
+    // Reorder idx_qo_kv_len_vec: walk levels from root (0).
+    // If any node at level L has kv_len >= 128: add all nodes at L and move on.
+    // If all nodes at L have kv_len < 128: add one node of L, then its children; then next node of L, then its children; and so on.
     std::vector<std::tuple<int, int, int>> reordered_idx_qo_kv_len_vec;
-    
+    std::set<size_t> already_output;
+
     if (tree_levels.size() >= 2) {
-      // Process level 0 (root)
-      for (int node_idx : tree_levels[0]) {
-        reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[node_idx]);
-      }
-      
-      // Process level 1
-      for (int node_idx : tree_levels[1]) {
-        reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[node_idx]);
-      }
-      
-      // Process remaining levels in pairs: for each parent at level L, process it then its children at level L+1
-      // Assumes uniform tree: all parents at level L have the same number of children
-      for (size_t level = 2; level < tree_levels.size(); level += 2) {
-        // Process nodes at current level (parents)
-        for (size_t parent_idx = 0; parent_idx < tree_levels[level].size(); ++parent_idx) {
-          int parent_node_idx = tree_levels[level][parent_idx];
-          reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[parent_node_idx]);
-          
-          // Process children of this parent (if next level exists)
-          // Assumes uniform distribution: children_per_parent is the same for all parents
-          if (level + 1 < tree_levels.size()) {
-            int children_per_parent = tree_levels[level + 1].size() / tree_levels[level].size();
-            int child_start = parent_idx * children_per_parent;
-            int child_end = (parent_idx + 1) * children_per_parent;
-            
-            for (int child_idx = child_start; child_idx < child_end && 
-                 child_idx < (int)tree_levels[level + 1].size(); ++child_idx) {
-              int child_node_idx = tree_levels[level + 1][child_idx];
-              reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[child_node_idx]);
-            }
+      for (size_t L = 0; L < tree_levels.size(); ++L) {
+        if (already_output.count(L) != 0) continue;
+
+        bool level_has_long_kv = false;
+        for (int node_idx : tree_levels[L]) {
+          if (std::get<2>(idx_qo_kv_len_vec[node_idx]) >= 128) {
+            level_has_long_kv = true;
+            break;
           }
         }
+
+        if (level_has_long_kv) {
+          for (int node_idx : tree_levels[L]) {
+            reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[node_idx]);
+          }
+          already_output.insert(L);
+        } else {
+          for (size_t parent_idx = 0; parent_idx < tree_levels[L].size(); ++parent_idx) {
+            int parent_node_idx = tree_levels[L][parent_idx];
+            reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[parent_node_idx]);
+            if (L + 1 < tree_levels.size()) {
+              int children_per_parent = tree_levels[L + 1].size() / tree_levels[L].size();
+              int child_start = parent_idx * children_per_parent;
+              int child_end = (parent_idx + 1) * children_per_parent;
+              for (int child_idx = child_start; child_idx < child_end &&
+                   child_idx < (int)tree_levels[L + 1].size(); ++child_idx) {
+                int child_node_idx = tree_levels[L + 1][child_idx];
+                reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[child_node_idx]);
+              }
+            }
+          }
+          already_output.insert(L);
+          if (L + 1 < tree_levels.size()) already_output.insert(L + 1);
+        }
       }
-      
-      // Replace original with reordered
+
       idx_qo_kv_len_vec = reordered_idx_qo_kv_len_vec;
     }
   } else {
@@ -1058,31 +1081,39 @@ inline cudaError_t PrefillSM90Plan(
   printf("\n--- Tile Assignment ---\n");
 #endif
 
+  // When mech1 (effective_kv_len > 128), assign the same Q tile to 4 CTAs so each CTA
+  // works on a subset of KV; the kernel handles kv_start/num_kv_tiles internally.
+  constexpr int kMech1NumReplicas = 4;
   for (int qo_head_idx = 0;
        qo_head_idx < (plan_info.same_schedule_for_all_heads ? 1 : num_qo_heads); ++qo_head_idx) {
     for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
       int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
       for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-        auto [cta_idx, accum_cost] = cta_cost_heap.pop();
         // NOTE(Zihao): our current FA3 implementation do not fuse query and group heads
         // so the group_size in cost_function is always 1
         int effective_kv_len =
             causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
                    : kv_len;
+        bool is_mech1 = (effective_kv_len >= 128);
+        int num_replicas = is_mech1 ? kMech1NumReplicas : 1;
         float tile_cost = cost_function(cta_tile_q, effective_kv_len);
+
+        for (int replica = 0; replica < num_replicas; ++replica) {
+          auto [cta_idx, accum_cost] = cta_cost_heap.pop();
 #ifdef FLASHINFER_DEBUG_SCHEDULER
-        printf("  Batch%d-Tile%d (qo_head=%d, eff_kv=%d, cost=%.1f) -> SM%d (prev_cost=%.1f, new_cost=%.1f)\n",
-               i, qo_tile_idx, qo_head_idx, effective_kv_len, tile_cost,
-               cta_idx, accum_cost, accum_cost + tile_cost);
+          printf("  Batch%d-Tile%d (qo_head=%d, eff_kv=%d, cost=%.1f, replica=%d/%d) -> SM%d (prev_cost=%.1f, new_cost=%.1f)\n",
+                 i, qo_tile_idx, qo_head_idx, effective_kv_len, tile_cost, replica, num_replicas,
+                 cta_idx, accum_cost, accum_cost + tile_cost);
 #endif
-        cta_cost_heap.insert({cta_idx, accum_cost + tile_cost});
-        cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
-        cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
-        cta_qo_len[cta_idx].push_back(qo_len);
-        cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
-        cta_kv_len[cta_idx].push_back(kv_len);
-        cta_head_indices[cta_idx].push_back(qo_head_idx);
-        cta_batch_indices[cta_idx].push_back(i);
+          cta_cost_heap.insert({cta_idx, accum_cost + tile_cost});
+          cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
+          cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
+          cta_qo_len[cta_idx].push_back(qo_len);
+          cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
+          cta_kv_len[cta_idx].push_back(kv_len);
+          cta_head_indices[cta_idx].push_back(qo_head_idx);
+          cta_batch_indices[cta_idx].push_back(i);
+        }
       }
     }
   }
@@ -1115,16 +1146,25 @@ inline cudaError_t PrefillSM90Plan(
          min_cost, max_cost, total_cost / num_sm90_ctas, 
          (max_cost - min_cost) / max_cost * 100.0f);
   
-  printf("\n--- Tile Assignment Details ---\n");
-  for (uint32_t sm = 0; sm < num_sm90_ctas; ++sm) {
-    int num_tiles = cta_qo_tile_indices[sm].size();
-    if (num_tiles > 0) {
-      printf("SM%d (%d tiles): ", sm, num_tiles);
-      for (int t = 0; t < num_tiles; ++t) {
-        printf("Batch%d-Tile%d", cta_batch_indices[sm][t], cta_qo_tile_indices[sm][t]);
-        if (t < num_tiles - 1) printf(", ");
-      }
-      printf("\n");
+  printf("\n--- CTA ID -> Work (per-CTA assignment) ---\n");
+  for (uint32_t cta_id = 0; cta_id < num_sm90_ctas; ++cta_id) {
+    int num_works = static_cast<int>(cta_qo_tile_indices[cta_id].size());
+    if (num_works == 0) continue;
+    int work_start = work_indptr_vec[cta_id];
+    int work_end = work_indptr_vec[cta_id + 1];
+    printf("CTA%d: work_indptr[%d..%d] (%d works)\n", cta_id, work_start, work_end - 1, num_works);
+    for (int t = 0; t < num_works; ++t) {
+      int batch = static_cast<int>(cta_batch_indices[cta_id][t]);
+      int qo_tile = static_cast<int>(cta_qo_tile_indices[cta_id][t]);
+      IdType qo_ptr = cta_qo_indptr[cta_id][t];
+      IdType kv_ptr = cta_kv_indptr[cta_id][t];
+      IdType qlen = cta_qo_len[cta_id][t];
+      IdType kvlen = cta_kv_len[cta_id][t];
+      int head = static_cast<int>(cta_head_indices[cta_id][t]);
+      printf("  work[%d]: batch=%d qo_tile=%d qo_indptr=%lld kv_indptr=%lld qo_len=%lld kv_len=%lld head=%d\n",
+             work_start + t, batch, qo_tile, static_cast<long long>(qo_ptr),
+             static_cast<long long>(kv_ptr), static_cast<long long>(qlen),
+             static_cast<long long>(kvlen), head);
     }
   }
   printf("==============================================\n\n");
@@ -1165,6 +1205,34 @@ inline cudaError_t PrefillSM90Plan(
   plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_batch_indices");
 
+  // Per-CTA mech array: 0 (mech1) if max KV length for that CTA > 128, else 1 (mech2)
+  std::vector<uint8_t> cta_mech_mode_vec(num_sm90_ctas, 0);
+  for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+    IdType max_kv = 0;
+    for (IdType kv_len_val : cta_kv_len[cta_idx]) {
+      max_kv = std::max(max_kv, kv_len_val);
+    }
+    cta_mech_mode_vec[cta_idx] = (max_kv >= 128) ? 0 : 1;
+  }
+
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+  printf("\n--- Per-CTA mech mode (mech1=KV>=128, mech2=KV<=128) ---\n");
+  printf("num_sm90_ctas=%u\n", num_sm90_ctas);
+  for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+    IdType max_kv = 0;
+    for (IdType kv_len_val : cta_kv_len[cta_idx]) {
+      max_kv = std::max(max_kv, kv_len_val);
+    }
+    uint8_t mode = cta_mech_mode_vec[cta_idx];
+    printf("  CTA%u: max_kv=%lld -> %s (mode=%u)\n", cta_idx,
+           static_cast<long long>(max_kv), mode == 0 ? "mech1" : "mech2", mode);
+  }
+  printf("==============================================\n\n");
+#endif
+
+  plan_info.cta_mech_mode_offset = int_allocator.aligned_alloc_offset(
+      sizeof(uint8_t) * num_sm90_ctas, 16, "batch_prefill_sm90_cta_mech_mode");
+
   IdType* qo_tile_indices_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
   IdType* qo_offset_h =
@@ -1188,6 +1256,9 @@ inline cudaError_t PrefillSM90Plan(
   std::copy(head_indices_vec.begin(), head_indices_vec.end(), head_indices_h);
   std::copy(work_indptr_vec.begin(), work_indptr_vec.end(), work_indptr_h);
   std::copy(batch_indices_vec.begin(), batch_indices_vec.end(), batch_indices_h);
+  uint8_t* cta_mech_mode_h =
+      GetPtrFromBaseOffset<uint8_t>(page_locked_int_buffer, plan_info.cta_mech_mode_offset);
+  std::copy(cta_mech_mode_vec.begin(), cta_mech_mode_vec.end(), cta_mech_mode_h);
 
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
