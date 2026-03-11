@@ -1,3 +1,6 @@
+example/*.csv
+example/*.pdf
+
 # ci
 flashinfer-whl/
 dist/
