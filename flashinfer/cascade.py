@@ -598,7 +598,10 @@ class MultiLevelCascadeAttentionWrapper:
             return_lse=True,
         )
 
-        
+
+        #print(f"out shape: {out.shape}")
+        #print(f"lse shape: {lse.shape}")
+        #print(f"out[:10]: {out[:10]}")
         if tree_nodes is not None:
             # Arbitrary tree structure merge
             # Output layout: [level0_results..., level1_results..., level2_results...]
@@ -607,7 +610,7 @@ class MultiLevelCascadeAttentionWrapper:
             
             batch_size = tree_nodes[-1]
             num_tree_levels = len(tree_nodes)
-            
+
             # Merge selected levels. When baseline=True, merge all levels (start=0, step=1).
             # Otherwise use merge_every_n_levels: skip first (merge_every_n_levels - 1) levels,
             # then merge every Nth (e.g. merge_every_n_levels=2 -> levels 1, 3, 5, ...).

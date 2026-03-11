@@ -40,7 +40,7 @@ parser.add_argument('--gqa', type=int, default=1,
                     help='GQA ratio (default: 1)')
 parser.add_argument('--warmup_iters', type=int, default=5,
                     help='Warmup iterations (default: 5)')
-parser.add_argument('--bench_iters', type=int, default=20,
+parser.add_argument('--bench_iters', type=int, default=100,
                     help='Benchmark iterations (default: 20)')
 args = parser.parse_args()
 

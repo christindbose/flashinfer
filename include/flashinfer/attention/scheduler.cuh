@@ -1081,7 +1081,7 @@ inline cudaError_t PrefillSM90Plan(
   printf("\n--- Tile Assignment ---\n");
 #endif
 
-  // When mech1 (effective_kv_len > 128), assign the same Q tile to 4 CTAs so each CTA
+  // When mech1 (effective_kv_len >= 128), assign the same Q tile to 4 CTAs so each CTA
   // works on a subset of KV; the kernel handles kv_start/num_kv_tiles internally.
   constexpr int kMech1NumReplicas = 4;
   for (int qo_head_idx = 0;
@@ -1205,7 +1205,7 @@ inline cudaError_t PrefillSM90Plan(
   plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_batch_indices");
 
-  // Per-CTA mech array: 0 (mech1) if max KV length for that CTA > 128, else 1 (mech2)
+  // Per-CTA mech array: mode=0 (mech1) if max KV length for that CTA >= 128, else mode=1 (mech2)
   std::vector<uint8_t> cta_mech_mode_vec(num_sm90_ctas, 0);
   for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
     IdType max_kv = 0;
