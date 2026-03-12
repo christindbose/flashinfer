@@ -139,6 +139,10 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
                                   ? GetPtrFromBaseOffset<uint8_t>(int_buffer_ptr,
                                                                    plan_info.cta_mech_mode_offset)
                                   : nullptr;
+        params.cta_valid_work = (plan_info.cta_valid_work_offset != 0)
+                                   ? GetPtrFromBaseOffset<uint8_t>(int_buffer_ptr,
+                                                                    plan_info.cta_valid_work_offset)
+                                   : nullptr;
         params.qo_tile_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
         params.qo_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_indptr_offset);
@@ -244,6 +248,10 @@ void BatchPrefillWithPagedKVCacheSM90Run(
                                   ? GetPtrFromBaseOffset<uint8_t>(int_buffer_ptr,
                                                                    plan_info.cta_mech_mode_offset)
                                   : nullptr;
+        params.cta_valid_work = (plan_info.cta_valid_work_offset != 0)
+                                   ? GetPtrFromBaseOffset<uint8_t>(int_buffer_ptr,
+                                                                    plan_info.cta_valid_work_offset)
+                                   : nullptr;
         params.qo_tile_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
         params.qo_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_indptr_offset);

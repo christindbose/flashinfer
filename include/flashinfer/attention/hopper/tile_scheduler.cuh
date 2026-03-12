@@ -89,6 +89,7 @@ struct BatchPrefillPersistentTileScheduler {
     bool kvsplit_mode;
     bool mech2_mode;
     uint8_t* cta_mech_mode;
+    uint8_t* cta_valid_work;  // per-CTA: 1 = valid work (any kv_len > 0), 0 = not
   };
 
   // Device side kernel params
@@ -99,13 +100,14 @@ struct BatchPrefillPersistentTileScheduler {
     bool kvsplit_mode;
     bool mech2_mode;
     uint8_t* cta_mech_mode;
+    uint8_t* cta_valid_work;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
     return {args.work_indptr, args.head_indices,  args.qo_tile_indices,
             args.qo_indptr,   args.kv_indptr,     args.qo_lens,
             args.kv_lens,     args.batch_indices, args.group_size_fastdiv,
-            args.kvsplit_mode, args.mech2_mode, args.cta_mech_mode};
+            args.kvsplit_mode, args.mech2_mode, args.cta_mech_mode, args.cta_valid_work};
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) { return {(unsigned)num_sm}; }
@@ -217,6 +219,7 @@ struct BatchPrefillTileScheduler {
     bool kvsplit_mode;
     bool mech2_mode;
     uint8_t* cta_mech_mode;
+    uint8_t* cta_valid_work;
   };
 
   // Device side kernel params
@@ -228,12 +231,13 @@ struct BatchPrefillTileScheduler {
     bool kvsplit_mode;
     bool mech2_mode;
     uint8_t* cta_mech_mode;
+    uint8_t* cta_valid_work;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
     return {args.work_indptr, args.qo_tile_indices, args.qo_indptr,     args.kv_indptr,
             args.qo_lens,     args.kv_lens,         args.batch_indices, args.group_size_fastdiv,
-            args.num_qo_heads, args.kvsplit_mode, args.mech2_mode, args.cta_mech_mode};
+            args.num_qo_heads, args.kvsplit_mode, args.mech2_mode, args.cta_mech_mode, args.cta_valid_work};
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) {

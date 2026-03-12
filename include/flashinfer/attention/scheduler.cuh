@@ -812,6 +812,7 @@ struct PrefillPlanSM90Info {
   int64_t work_indptr_offset;
   int64_t batch_indices_offset;
   int64_t cta_mech_mode_offset;
+  int64_t cta_valid_work_offset;  // per-CTA: 1 = has valid work (any kv_len > 0), 0 = not
   bool same_schedule_for_all_heads;
   bool kvsplit_mode;
   bool mech2_mode;
@@ -826,6 +827,7 @@ struct PrefillPlanSM90Info {
         work_indptr_offset(0),
         batch_indices_offset(0),
         cta_mech_mode_offset(0),
+        cta_valid_work_offset(0),
         same_schedule_for_all_heads(false),
         kvsplit_mode(false),
         mech2_mode(false) {}
@@ -835,6 +837,7 @@ struct PrefillPlanSM90Info {
     return {qo_tile_indices_offset, qo_indptr_offset,     kv_indptr_offset,
             qo_len_offset,          kv_len_offset,        head_indices_offset,
             work_indptr_offset,     batch_indices_offset, cta_mech_mode_offset,
+            cta_valid_work_offset,
             same_schedule_for_all_heads,
             static_cast<int64_t>(kvsplit_mode), static_cast<int64_t>(mech2_mode)};
   }
@@ -853,6 +856,7 @@ struct PrefillPlanSM90Info {
       batch_indices_offset = vec[7];
       same_schedule_for_all_heads = vec[8];
       cta_mech_mode_offset = 0;
+      cta_valid_work_offset = 0;
       kvsplit_mode = false;
       mech2_mode = false;
     } else if (vec.size() == 11) {
@@ -869,6 +873,7 @@ struct PrefillPlanSM90Info {
       kvsplit_mode = static_cast<bool>(vec[9]);
       mech2_mode = static_cast<bool>(vec[10]);
       cta_mech_mode_offset = 0;
+      cta_valid_work_offset = 0;
     } else if (vec.size() == 12) {
       // New format with per-CTA mech array offset
       qo_tile_indices_offset = vec[0];
@@ -880,12 +885,28 @@ struct PrefillPlanSM90Info {
       work_indptr_offset = vec[6];
       batch_indices_offset = vec[7];
       cta_mech_mode_offset = vec[8];
+      cta_valid_work_offset = 0;
       same_schedule_for_all_heads = vec[9];
       kvsplit_mode = static_cast<bool>(vec[10]);
       mech2_mode = static_cast<bool>(vec[11]);
+    } else if (vec.size() == 13) {
+      // Format with per-CTA mech and per-CTA valid-work array offsets
+      qo_tile_indices_offset = vec[0];
+      qo_indptr_offset = vec[1];
+      kv_indptr_offset = vec[2];
+      qo_len_offset = vec[3];
+      kv_len_offset = vec[4];
+      head_indices_offset = vec[5];
+      work_indptr_offset = vec[6];
+      batch_indices_offset = vec[7];
+      cta_mech_mode_offset = vec[8];
+      cta_valid_work_offset = vec[9];
+      same_schedule_for_all_heads = vec[10];
+      kvsplit_mode = static_cast<bool>(vec[11]);
+      mech2_mode = static_cast<bool>(vec[12]);
     } else {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, 11 or 12, but got "
+      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, 11, 12 or 13, but got "
               << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
@@ -1215,8 +1236,21 @@ inline cudaError_t PrefillSM90Plan(
     cta_mech_mode_vec[cta_idx] = (max_kv >= 128) ? 0 : 1;
   }
 
+  // Per-CTA valid work: 1 if CTA has at least one work item with kv_len > 0, else 0
+  std::vector<uint8_t> cta_valid_work_vec(num_sm90_ctas, 0);
+  for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+    bool has_valid = false;
+    for (IdType kv_len_val : cta_kv_len[cta_idx]) {
+      if (kv_len_val > 0) {
+        has_valid = true;
+        break;
+      }
+    }
+    cta_valid_work_vec[cta_idx] = has_valid ? 1 : 0;
+  }
+
 #ifdef FLASHINFER_DEBUG_SCHEDULER
-  printf("\n--- Per-CTA mech mode (mech1=KV>=128, mech2=KV<=128) ---\n");
+  printf("\n--- Per-CTA mech mode (mech1=KV>=128, mech2=KV<128) ---\n");
   printf("num_sm90_ctas=%u\n", num_sm90_ctas);
   for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
     IdType max_kv = 0;
@@ -1224,14 +1258,17 @@ inline cudaError_t PrefillSM90Plan(
       max_kv = std::max(max_kv, kv_len_val);
     }
     uint8_t mode = cta_mech_mode_vec[cta_idx];
-    printf("  CTA%u: max_kv=%lld -> %s (mode=%u)\n", cta_idx,
-           static_cast<long long>(max_kv), mode == 0 ? "mech1" : "mech2", mode);
+    uint8_t valid = cta_valid_work_vec[cta_idx];
+    printf("  CTA%u: max_kv=%lld -> %s (mode=%u) valid_work=%u\n", cta_idx,
+           static_cast<long long>(max_kv), mode == 0 ? "mech1" : "mech2", mode, valid);
   }
   printf("==============================================\n\n");
 #endif
 
   plan_info.cta_mech_mode_offset = int_allocator.aligned_alloc_offset(
       sizeof(uint8_t) * num_sm90_ctas, 16, "batch_prefill_sm90_cta_mech_mode");
+  plan_info.cta_valid_work_offset = int_allocator.aligned_alloc_offset(
+      sizeof(uint8_t) * num_sm90_ctas, 16, "batch_prefill_sm90_cta_valid_work");
 
   IdType* qo_tile_indices_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
@@ -1259,6 +1296,9 @@ inline cudaError_t PrefillSM90Plan(
   uint8_t* cta_mech_mode_h =
       GetPtrFromBaseOffset<uint8_t>(page_locked_int_buffer, plan_info.cta_mech_mode_offset);
   std::copy(cta_mech_mode_vec.begin(), cta_mech_mode_vec.end(), cta_mech_mode_h);
+  uint8_t* cta_valid_work_h =
+      GetPtrFromBaseOffset<uint8_t>(page_locked_int_buffer, plan_info.cta_valid_work_offset);
+  std::copy(cta_valid_work_vec.begin(), cta_valid_work_vec.end(), cta_valid_work_h);
 
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,

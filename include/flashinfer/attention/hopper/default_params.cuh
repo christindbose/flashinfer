@@ -113,6 +113,7 @@ struct BatchPrefillRaggedParams {
   bool kvsplit_mode;
   bool mech2_mode;
   uint8_t* cta_mech_mode;  // per-CTA mech: 0 = mech1, 1 = mech2; null = use mech2_mode
+  uint8_t* cta_valid_work;  // per-CTA: 1 = valid work (any kv_len > 0), 0 = not; null = assume all valid
 };
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
@@ -167,6 +168,7 @@ struct BatchPrefillPagedParams {
   bool kvsplit_mode;
   bool mech2_mode;
   uint8_t* cta_mech_mode;  // per-CTA mech: 0 = mech1, 1 = mech2; null = use mech2_mode
+  uint8_t* cta_valid_work;  // per-CTA: 1 = valid work (any kv_len > 0), 0 = not; null = assume all valid
 };
 
 }  // namespace flashinfer
