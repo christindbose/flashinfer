@@ -81,7 +81,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   static constexpr int CTA_Q = Ktraits::CTA_Q;
   static constexpr int CTA_KV = Ktraits::CTA_KV;
 
-  bool kvsplit_mode;
+  bool kvsplit_mode = false;
   //bool mask_mode = scheduler_params.mech2_mode;
   
   /*
@@ -91,19 +91,36 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   */
   bool mech2_mode = scheduler_params.mech2_mode;
 
-  /*
-  mech2_mode = (scheduler_params.cta_mech_mode != nullptr)
-  ? (scheduler_params.cta_mech_mode[blockIdx.x] != 0)
-  : scheduler_params.mech2_mode;
-
-  kvsplit_mode = !mech2_mode;
-   
   
+  // check the valid cta work
+  
+  if (scheduler_params.cta_valid_work != nullptr) {
+    int has_valid_work = scheduler_params.cta_valid_work[blockIdx.x];
+    if (has_valid_work == 0) {
+      mech2_mode = false;
+      kvsplit_mode = false;
+    }
+    else {
+      mech2_mode = (scheduler_params.cta_mech_mode != nullptr)
+                        ? (scheduler_params.cta_mech_mode[blockIdx.x] != 0)
+                        : scheduler_params.mech2_mode;
+      kvsplit_mode = !mech2_mode;
+
+    }
+  }
+  
+  
+  namespace cg = cooperative_groups;
+  cg::cluster_group cluster = cg::this_cluster();
+  unsigned int clusterBlockRank = cluster.block_rank();
+  unsigned int cluster_size = static_cast<unsigned int>(cluster.dim_blocks().x);
+
+  /*
   if (threadIdx.x == 0 && threadIdx.y == 0) {
-    printf("SMID: %d, blockIdx.x: %d, mech2_mode: %d, kvsplit_mode: %d\n", smid(), blockIdx.x, mech2_mode, kvsplit_mode);
+    printf("SMID: %d, blockIdx.x: %d, clusterBlockRank: %d,  mech2_mode: %d, kvsplit_mode: %d\n", smid(), blockIdx.x, clusterBlockRank, mech2_mode, kvsplit_mode);
   }
   */
-  //printf("SMID: %d, kvsplit_mode: %d, mech2_mode: %d\n", smid(), kvsplit_mode, mech2_mode);
+  
 
   static constexpr bool use_tma_load_kv = CollectiveMainloop::USE_TMA_LOAD_KV;
 
@@ -125,10 +142,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     CollectiveEpilogue::prefetch_tma_descriptors(epilogue_params);
   }
 
-  namespace cg = cooperative_groups;
-  cg::cluster_group cluster = cg::this_cluster();
-  unsigned int clusterBlockRank = cluster.block_rank();
-  unsigned int cluster_size = static_cast<unsigned int>(cluster.dim_blocks().x);
+
 
   //printf("clusterBlockRank: %d, cluster_size: %d\n", clusterBlockRank, cluster_size);
 
@@ -173,6 +187,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     shared_storage.barrier_r_end_mech2.init(/*num_threads=*/cluster_size * NUM_MMA_THREADS);
     //printf("barrier_r initialized with num_threads: %d\n", cluster_size * NUM_MMA_THREADS);
   }
+  
   // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
   MainloopPipeline pipeline_k = [&] {
     if constexpr (use_tma_load_kv) {
@@ -199,8 +214,9 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
   // We need this to guarantee that the Pipeline init is visible to all producers and consumer
   // blocks in the Cluster
-  __syncthreads();
-
+  //__syncthreads();
+  cluster.sync();
+  
   uint32_t* maybe_prefix_len_ptr = nullptr;
   if constexpr (has_maybe_prefix_len_ptr_v<decltype(mainloop_params.additional_params)>) {
     maybe_prefix_len_ptr = mainloop_params.additional_params.maybe_prefix_len_ptr;
@@ -262,6 +278,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         int num_kv_tiles =
             collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
         if (num_kv_tiles <= 0) {
+
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
           scheduler.broadcast_next_work(work_tile_info);
           continue;
@@ -280,6 +297,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
           num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
         }
+
         if constexpr (MULTIITEMSCORING) {
           collective_mainloop.load<LEFT_SLIDING_WINDOW>(
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
@@ -299,6 +317,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                 shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx, 0,0, clusterBlockRank, cluster_size, kvsplit_mode);
             
                 }
+
         ++work_idx;
       }
       collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
