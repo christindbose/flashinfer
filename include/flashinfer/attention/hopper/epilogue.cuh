@@ -284,7 +284,7 @@ struct CollectiveEpilogue {
             typename TiledMma>
   CUTLASS_DEVICE void store_new_mech2(Params const& epilogue_params, FrgTensorO const& tOrO,
                             FrgTensorLSE const& lse, SharedStorage& shared_storage,
-                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord, const int clusterBlockRank = 0, const int cluster_size = 1, const bool mech2_mode = false) {
+                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord, const int clusterBlockRank = 0, const int cluster_size = 1, const bool mech2_mode = false, const bool is_dummy = false) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
@@ -295,27 +295,24 @@ struct CollectiveEpilogue {
     Tensor tOrO_retile = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
     Tensor tOsO = smem_thr_copy_O.partition_D(sO);            // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
-    // Make sure all WGs have finished reading V
-    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
-                                      /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
-    cute::copy(smem_tiled_copy_O, tOrO_retile, tOsO);
-    cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
-    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
-      cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);    
-
-      
-
-    //printf("in epilogue mech2 mode\n");
+    if (!is_dummy) {
+      // Make sure all WGs have finished reading V
+      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
+                                        /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
+      cute::copy(smem_tiled_copy_O, tOrO_retile, tOsO);
+      cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
+      cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    }
 
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
 
-    
     if (clusterBlockRank == 0){
       shared_storage.barrier_r_start_mech2.arrive();
 
       for (int i = 1; i < cluster_size; i++){
-        shared_storage.barrier_r_start_mech2.arrive(static_cast<uint32_t>(i), 1UL);    
+        shared_storage.barrier_r_start_mech2.arrive(static_cast<uint32_t>(i), 1UL);
       }
 
       shared_storage.barrier_r_end_mech2.arrive();
@@ -323,8 +320,6 @@ struct CollectiveEpilogue {
       cutlass::ConsumerToken barrier_token =
       static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_end_mech2.try_wait(0));
       if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
-        //printf("barrier_token: %u SM id: %u\n",
-              //static_cast<unsigned>(barrier_token.get()), smid());
         shared_storage.barrier_r_end_mech2.wait(0);
       }
 
@@ -334,56 +329,42 @@ struct CollectiveEpilogue {
       cutlass::ConsumerToken barrier_token =
       static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_start_mech2.try_wait(0));
       if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
-            //printf("barrier_token: %u SM id: %u\n",
-                  //static_cast<unsigned>(barrier_token.get()), smid());
             shared_storage.barrier_r_start_mech2.wait(0);
       }
 
+      if (is_dummy) {
+        // Dummy CTA: signal barrier completion but skip DSMEM read and write-back
+        shared_storage.barrier_r_end_mech2.arrive(static_cast<uint32_t>(0), 1UL);
+        return;
+      }
+
       Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 0)), SmemLayoutO{});
-      //Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 0)), SmemLayoutO{});
 
       // Load peer CTA's shared-memory tile (sO_1) into registers.
-      // Use partition_S for smem (source layout for reading)
-      Tensor tOsO_1 = smem_thr_copy_O.partition_S(sO_1);  // Partition shared memory (S layout - for reading)
-      Tensor tOrO_1 = make_fragment_like(tOsO_1);          // Create register fragment matching S layout
-      
+      Tensor tOsO_1 = smem_thr_copy_O.partition_S(sO_1);
+      Tensor tOrO_1 = make_fragment_like(tOsO_1);
+
       // Copy FROM shared memory (sO_1) TO registers (tOrO_1)
-      // Use implicit auto-vectorizing copy - CUTE will vectorize if layouts are compatible
       cute::copy(tOsO_1, tOrO_1);
 
-      //printf("tOrO_1: %f\n", static_cast<float>(tOrO_1(0, 0, 0)));
-      
-
       shared_storage.barrier_r_end_mech2.arrive(static_cast<uint32_t>(0), 1UL);
-      
-      // Reduction operations: Add tOrO_1 (from peer CTA) with local tOrO
-      // tOrO_retile is already computed above and has the same layout as tOrO_1 (both S layout)
-      // Verify sizes match
+
+      // Reduction: Add tOrO_1 (from peer CTA) with local tOrO
       CUTE_STATIC_ASSERT_V(size(tOrO_1) == size(tOrO_retile));
-      
-      // Create result tensor matching tOrO_1's layout
+
       Tensor tOrO_final = make_fragment_like(tOrO_1);
-      
-      // Element-wise addition using flattening and integer indexing
-      // Flatten all tensors to 1D for simple element-wise access
+
       auto tOrO_1_flat = flatten(tOrO_1);
       auto tOrO_retile_flat = flatten(tOrO_retile);
       auto tOrO_final_flat = flatten(tOrO_final);
-      
+
       CUTE_STATIC_ASSERT_V(size(tOrO_1_flat) == size(tOrO_retile_flat));
       CUTE_STATIC_ASSERT_V(size(tOrO_1_flat) == size(tOrO_final_flat));
-      
+
       CUTE_UNROLL
       for (int i = 0; i < size(tOrO_final_flat); ++i) {
           tOrO_final_flat(i) = tOrO_1_flat(i) + tOrO_retile_flat(i);
       }
-      
-      //printf("tOrO_final: %f\n", static_cast<float>(tOrO_final_flat(0)));
-
-
-      //printf("tOrO_final: %f\n", static_cast<float>(tOrO_final(0, 0, 0)));
-
-    
 
       int write_warp_idx = NUM_WARPS - 1;
       if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
@@ -391,11 +372,9 @@ struct CollectiveEpilogue {
                                           cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
       }
       TiledCopyO gmem_tiled_copy_O;
-      // Write tOrO_final (register tensor) directly to global memory
       write_O_new<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
                                     select<0, 1>(TileShape_PDV{}), tOrO_final, thread_idx, qo_tile_idx,
                                     qo_head_idx, qo_indptr, qo_len, write_warp_idx);
-
 
     }
   }

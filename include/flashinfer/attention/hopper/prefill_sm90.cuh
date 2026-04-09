@@ -82,18 +82,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   static constexpr int CTA_KV = Ktraits::CTA_KV;
 
   bool kvsplit_mode = false;
-  //bool mask_mode = scheduler_params.mech2_mode;
-  
-  /*
-  bool mech2_mode = (scheduler_params.cta_mech_mode != nullptr)
-                        ? (scheduler_params.cta_mech_mode[blockIdx.x] != 0)
-                        : scheduler_params.mech2_mode;
-  */
   bool mech2_mode = scheduler_params.mech2_mode;
 
-  
+  // Check if this CTA is a dummy (cluster padding for mech2)
+  bool is_dummy_cta = (scheduler_params.cta_is_dummy != nullptr)
+                          ? (scheduler_params.cta_is_dummy[blockIdx.x] != 0)
+                          : false;
+
   // check the valid cta work
-  
   if (scheduler_params.cta_valid_work != nullptr) {
     int has_valid_work = scheduler_params.cta_valid_work[blockIdx.x];
     if (has_valid_work == 0) {
@@ -105,7 +101,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                         ? (scheduler_params.cta_mech_mode[blockIdx.x] != 0)
                         : scheduler_params.mech2_mode;
       kvsplit_mode = !mech2_mode;
-
     }
   }
   
@@ -250,7 +245,9 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     }
 
     int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
-    if (!use_tma_load_kv || warp_idx_in_warpgroup == 0) {  // Load Q, K, V
+    if (is_dummy_cta) {
+      // Dummy CTA: skip all producer work (no TMA loads)
+    } else if (!use_tma_load_kv || warp_idx_in_warpgroup == 0) {  // Load Q, K, V
       PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
       PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
 
@@ -366,10 +363,29 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
     //printf("clusterBlockRank: %d, cluster_size: %d\n", clusterBlockRank, cluster_size);
 
-    
+
     int work_idx = 0;
+
+    if (is_dummy_cta) {
+      // Dummy CTA: skip all computation, only participate in mech2 barriers.
+      // Iterate through work items to match the real CTAs' barrier calls.
+      for (auto work_tile_info = scheduler.get_initial_work(scheduler_params);
+           work_tile_info.is_valid(scheduler_params);
+           work_tile_info = scheduler.template get_next_work</*is_producer=*/false>(scheduler_params,
+                                                                                    work_tile_info)) {
+        auto block_coord = work_tile_info.get_block_coord(scheduler_params);
+        Tensor tOrO_dummy = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_PDV{}));
+        float lse_dummy = -INFINITY;
+        // Participate in mech2 barriers without computing or writing
+        collective_epilogue.store_new_mech2(epilogue_params, tOrO_dummy, lse_dummy, shared_storage,
+                              tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, clusterBlockRank, cluster_size, mech2_mode, /*is_dummy=*/true);
+        ++work_idx;
+      }
+      collective_epilogue.store_tail();
+    } else {
+
     CUTLASS_PRAGMA_NO_UNROLL
-    
+
     for (auto work_tile_info = scheduler.get_initial_work(scheduler_params);
          work_tile_info.is_valid(scheduler_params);
          work_tile_info = scheduler.template get_next_work</*is_producer=*/false>(scheduler_params,
@@ -546,6 +562,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       ++work_idx;
     }
     collective_epilogue.store_tail();
+
+    } // end else (!is_dummy_cta)
 
     uint32_t consumer_stop = 0;
     asm volatile("mov.u32 %0, %%clock;" : "=r"(consumer_stop)::"memory");
