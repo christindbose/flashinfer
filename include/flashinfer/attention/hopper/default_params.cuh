@@ -114,6 +114,7 @@ struct BatchPrefillRaggedParams {
   bool mech2_mode;
   uint8_t* cta_mech_mode;  // per-CTA mech: 0 = mech1, 1 = mech2; null = use mech2_mode
   uint8_t* cta_valid_work;  // per-CTA: 1 = valid work (any kv_len > 0), 0 = not; null = assume all valid
+  uint8_t* cta_is_dummy;   // per-CTA: 1 = dummy CTA for mech2 cluster padding, 0 = real; null = no dummies
 };
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
@@ -169,6 +170,7 @@ struct BatchPrefillPagedParams {
   bool mech2_mode;
   uint8_t* cta_mech_mode;  // per-CTA mech: 0 = mech1, 1 = mech2; null = use mech2_mode
   uint8_t* cta_valid_work;  // per-CTA: 1 = valid work (any kv_len > 0), 0 = not; null = assume all valid
+  uint8_t* cta_is_dummy;   // per-CTA: 1 = dummy CTA for mech2 cluster padding, 0 = real; null = no dummies
 };
 
 }  // namespace flashinfer

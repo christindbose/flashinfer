@@ -813,6 +813,7 @@ struct PrefillPlanSM90Info {
   int64_t batch_indices_offset;
   int64_t cta_mech_mode_offset;
   int64_t cta_valid_work_offset;  // per-CTA: 1 = has valid work (any kv_len > 0), 0 = not
+  int64_t cta_is_dummy_offset;    // per-CTA: 1 = dummy CTA for mech2 cluster padding, 0 = real
   bool same_schedule_for_all_heads;
   bool kvsplit_mode;
   bool mech2_mode;
@@ -828,6 +829,7 @@ struct PrefillPlanSM90Info {
         batch_indices_offset(0),
         cta_mech_mode_offset(0),
         cta_valid_work_offset(0),
+        cta_is_dummy_offset(0),
         same_schedule_for_all_heads(false),
         kvsplit_mode(false),
         mech2_mode(false) {}
@@ -837,7 +839,7 @@ struct PrefillPlanSM90Info {
     return {qo_tile_indices_offset, qo_indptr_offset,     kv_indptr_offset,
             qo_len_offset,          kv_len_offset,        head_indices_offset,
             work_indptr_offset,     batch_indices_offset, cta_mech_mode_offset,
-            cta_valid_work_offset,
+            cta_valid_work_offset,  cta_is_dummy_offset,
             same_schedule_for_all_heads,
             static_cast<int64_t>(kvsplit_mode), static_cast<int64_t>(mech2_mode)};
   }
@@ -901,12 +903,29 @@ struct PrefillPlanSM90Info {
       batch_indices_offset = vec[7];
       cta_mech_mode_offset = vec[8];
       cta_valid_work_offset = vec[9];
+      cta_is_dummy_offset = 0;
       same_schedule_for_all_heads = vec[10];
       kvsplit_mode = static_cast<bool>(vec[11]);
       mech2_mode = static_cast<bool>(vec[12]);
+    } else if (vec.size() == 14) {
+      // Format with per-CTA mech, valid-work, and dummy array offsets
+      qo_tile_indices_offset = vec[0];
+      qo_indptr_offset = vec[1];
+      kv_indptr_offset = vec[2];
+      qo_len_offset = vec[3];
+      kv_len_offset = vec[4];
+      head_indices_offset = vec[5];
+      work_indptr_offset = vec[6];
+      batch_indices_offset = vec[7];
+      cta_mech_mode_offset = vec[8];
+      cta_valid_work_offset = vec[9];
+      cta_is_dummy_offset = vec[10];
+      same_schedule_for_all_heads = vec[11];
+      kvsplit_mode = static_cast<bool>(vec[12]);
+      mech2_mode = static_cast<bool>(vec[13]);
     } else {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, 11, 12 or 13, but got "
+      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, 11, 12, 13 or 14, but got "
               << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
@@ -955,6 +974,12 @@ inline cudaError_t PrefillSM90Plan(
   }
 #endif
 
+  std::vector<bool> is_dummy_cta_vec;
+  // Per-entry cluster group ID: entries with same group_id >= 0 must be assigned to
+  // cluster-aligned CTAs. -1 means no cluster constraint (use normal min-heap assignment).
+  std::vector<int> cluster_group_id_vec;
+  int next_cluster_group_id = 0;
+
   if (use_tree_walk_scheduling) {
     // Tree-based 2-level walk scheduling (assumes uniform/balanced trees):
     // Infer tree structure from qo_indptr by grouping nodes with same qo_len
@@ -993,20 +1018,42 @@ inline cudaError_t PrefillSM90Plan(
         if (level_has_long_kv) {
           for (int node_idx : tree_levels[L]) {
             reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[node_idx]);
+            is_dummy_cta_vec.push_back(false);
+            cluster_group_id_vec.push_back(-1);  // mech1: no cluster constraint
           }
           already_output.insert(L);
         } else {
+          constexpr int kMech2ClusterSize = 4;
           for (size_t parent_idx = 0; parent_idx < tree_levels[L].size(); ++parent_idx) {
+            int group_id = next_cluster_group_id++;
             int parent_node_idx = tree_levels[L][parent_idx];
             reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[parent_node_idx]);
+            is_dummy_cta_vec.push_back(false);
+            cluster_group_id_vec.push_back(group_id);
             if (L + 1 < tree_levels.size()) {
               int children_per_parent = tree_levels[L + 1].size() / tree_levels[L].size();
               int child_start = parent_idx * children_per_parent;
               int child_end = (parent_idx + 1) * children_per_parent;
+              int num_children = 0;
               for (int child_idx = child_start; child_idx < child_end &&
                    child_idx < (int)tree_levels[L + 1].size(); ++child_idx) {
                 int child_node_idx = tree_levels[L + 1][child_idx];
                 reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[child_node_idx]);
+                is_dummy_cta_vec.push_back(false);
+                cluster_group_id_vec.push_back(group_id);
+                num_children++;
+              }
+              // Pad with dummy CTAs if children < kMech2ClusterSize for mech2 cluster alignment
+              int total_in_group = 1 + num_children;  // parent + children
+              int remainder = total_in_group % kMech2ClusterSize;
+              if (remainder != 0) {
+                int num_dummies = kMech2ClusterSize - remainder;
+                // Use parent's entry as template for dummy (same qo/kv metadata, marked invalid)
+                for (int d = 0; d < num_dummies; ++d) {
+                  reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[parent_node_idx]);
+                  is_dummy_cta_vec.push_back(true);
+                  cluster_group_id_vec.push_back(group_id);
+                }
               }
             }
           }
@@ -1017,7 +1064,22 @@ inline cudaError_t PrefillSM90Plan(
 
       idx_qo_kv_len_vec = reordered_idx_qo_kv_len_vec;
     }
-  } else {
+  }
+
+  // Build per-entry dummy flag and cluster group ID aligned with idx_qo_kv_len_vec.
+  // Non-tree-walk paths have no dummies and no cluster constraints.
+  std::vector<bool> idx_is_dummy(idx_qo_kv_len_vec.size(), false);
+  std::vector<int> idx_cluster_group(idx_qo_kv_len_vec.size(), -1);
+  if (use_tree_walk_scheduling && !is_dummy_cta_vec.empty()) {
+    for (size_t i = 0; i < is_dummy_cta_vec.size() && i < idx_is_dummy.size(); ++i) {
+      idx_is_dummy[i] = is_dummy_cta_vec[i];
+    }
+    for (size_t i = 0; i < cluster_group_id_vec.size() && i < idx_cluster_group.size(); ++i) {
+      idx_cluster_group[i] = cluster_group_id_vec[i];
+    }
+  }
+
+  if (!use_tree_walk_scheduling) {
     // Original scheduling: sort by kv_len descending, then batch_idx ascending
     std::sort(idx_qo_kv_len_vec.begin(), idx_qo_kv_len_vec.end(),
               [](const auto& a, const auto& b) {
@@ -1105,36 +1167,142 @@ inline cudaError_t PrefillSM90Plan(
   // When mech1 (effective_kv_len >= 128), assign the same Q tile to 4 CTAs so each CTA
   // works on a subset of KV; the kernel handles kv_start/num_kv_tiles internally.
   constexpr int kMech1NumReplicas = 4;
+  constexpr int kClusterSize = 4;
+  // Track which CTAs received real vs dummy work items
+  std::vector<bool> cta_has_real_work(num_sm90_ctas, false);
+  std::vector<bool> cta_has_dummy_work(num_sm90_ctas, false);
+  // Track per-CTA accumulated cost for cluster-aligned assignment (parallel to min-heap)
+  std::vector<float> cta_cost(num_sm90_ctas, 0.0f);
+  // Track which cluster groups have already been assigned (group_id -> base CTA)
+  std::unordered_map<int, int> cluster_group_base;
+
+  // Helper: find the least-loaded cluster-aligned base CTA
+  auto find_best_cluster_base = [&]() -> int {
+    int num_clusters = num_sm90_ctas / kClusterSize;
+    int best_base = 0;
+    float best_cost = std::numeric_limits<float>::max();
+    for (int c = 0; c < num_clusters; ++c) {
+      int base = c * kClusterSize;
+      float max_cost_in_cluster = 0.0f;
+      for (int j = 0; j < kClusterSize; ++j) {
+        max_cost_in_cluster = std::max(max_cost_in_cluster, cta_cost[base + j]);
+      }
+      if (max_cost_in_cluster < best_cost) {
+        best_cost = max_cost_in_cluster;
+        best_base = base;
+      }
+    }
+    return best_base;
+  };
+
   for (int qo_head_idx = 0;
        qo_head_idx < (plan_info.same_schedule_for_all_heads ? 1 : num_qo_heads); ++qo_head_idx) {
-    for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
-      int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
-      for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-        // NOTE(Zihao): our current FA3 implementation do not fuse query and group heads
-        // so the group_size in cost_function is always 1
-        int effective_kv_len =
-            causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
-                   : kv_len;
-        bool is_mech1 = (effective_kv_len >= 128);
-        int num_replicas = is_mech1 ? kMech1NumReplicas : 1;
-        float tile_cost = cost_function(cta_tile_q, effective_kv_len);
+    size_t vec_idx = 0;
+    while (vec_idx < idx_qo_kv_len_vec.size()) {
+      int group_id = idx_cluster_group[vec_idx];
 
-        for (int replica = 0; replica < num_replicas; ++replica) {
-          auto [cta_idx, accum_cost] = cta_cost_heap.pop();
-#ifdef FLASHINFER_DEBUG_SCHEDULER
-          printf("  Batch%d-Tile%d (qo_head=%d, eff_kv=%d, cost=%.1f, replica=%d/%d) -> SM%d (prev_cost=%.1f, new_cost=%.1f)\n",
-                 i, qo_tile_idx, qo_head_idx, effective_kv_len, tile_cost, replica, num_replicas,
-                 cta_idx, accum_cost, accum_cost + tile_cost);
-#endif
-          cta_cost_heap.insert({cta_idx, accum_cost + tile_cost});
-          cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
-          cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
-          cta_qo_len[cta_idx].push_back(qo_len);
-          cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
-          cta_kv_len[cta_idx].push_back(kv_len);
-          cta_head_indices[cta_idx].push_back(qo_head_idx);
-          cta_batch_indices[cta_idx].push_back(i);
+      if (group_id >= 0) {
+        // Cluster-aligned group: collect all entries with same group_id
+        size_t group_start = vec_idx;
+        while (vec_idx < idx_qo_kv_len_vec.size() && idx_cluster_group[vec_idx] == group_id) {
+          vec_idx++;
         }
+        size_t group_size = vec_idx - group_start;
+
+        // Find or reuse cluster-aligned base CTA for this group
+        int base_cta;
+        auto it = cluster_group_base.find(group_id);
+        if (it != cluster_group_base.end()) {
+          base_cta = it->second;
+        } else {
+          base_cta = find_best_cluster_base();
+          cluster_group_base[group_id] = base_cta;
+        }
+
+        // Assign each entry in the group to consecutive CTAs within the cluster
+        for (size_t g = 0; g < group_size; ++g) {
+          size_t entry_idx = group_start + g;
+          auto& [i, qo_len, kv_len] = idx_qo_kv_len_vec[entry_idx];
+          bool is_dummy = idx_is_dummy[entry_idx];
+          int cta_idx = base_cta + static_cast<int>(g % kClusterSize);
+          int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
+
+          for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
+            int effective_kv_len =
+                causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
+                       : kv_len;
+            float tile_cost = is_dummy ? 0.0f : cost_function(cta_tile_q, effective_kv_len);
+
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+            printf("  Batch%d-Tile%d (qo_head=%d, eff_kv=%d, cost=%.1f, dummy=%d, cluster_group=%d) -> SM%d (cluster base=%d)\n",
+                   i, qo_tile_idx, qo_head_idx, effective_kv_len, tile_cost,
+                   is_dummy, group_id, cta_idx, base_cta);
+#endif
+            cta_cost[cta_idx] += tile_cost;
+            cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
+            cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
+            cta_qo_len[cta_idx].push_back(qo_len);
+            cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
+            cta_kv_len[cta_idx].push_back(is_dummy ? 0 : kv_len);
+            cta_head_indices[cta_idx].push_back(qo_head_idx);
+            cta_batch_indices[cta_idx].push_back(i);
+            if (!is_dummy) {
+              cta_has_real_work[cta_idx] = true;
+            } else {
+              cta_has_dummy_work[cta_idx] = true;
+            }
+          }
+        }
+
+        // Rebuild the min-heap to reflect updated costs after cluster assignment.
+        // MinHeap constructor initializes all entries with cost 0, so we pop all
+        // and re-insert with actual costs.
+        cta_cost_heap = MinHeap(num_sm90_ctas);
+        // Pop all default-initialized entries
+        for (uint32_t c = 0; c < num_sm90_ctas; ++c) {
+          cta_cost_heap.pop();
+        }
+        // Re-insert with actual costs
+        for (uint32_t c = 0; c < num_sm90_ctas; ++c) {
+          cta_cost_heap.insert({static_cast<int>(c), cta_cost[c]});
+        }
+      } else {
+        // Normal min-heap assignment (mech1 or unconstrained)
+        auto& [i, qo_len, kv_len] = idx_qo_kv_len_vec[vec_idx];
+        bool is_dummy = idx_is_dummy[vec_idx];
+        int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
+        for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
+          int effective_kv_len =
+              causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
+                     : kv_len;
+          bool is_mech1 = (effective_kv_len >= 128);
+          int num_replicas = is_mech1 ? kMech1NumReplicas : 1;
+          float tile_cost = is_dummy ? 0.0f : cost_function(cta_tile_q, effective_kv_len);
+
+          for (int replica = 0; replica < num_replicas; ++replica) {
+            auto [cta_idx, accum_cost] = cta_cost_heap.pop();
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+            printf("  Batch%d-Tile%d (qo_head=%d, eff_kv=%d, cost=%.1f, replica=%d/%d, dummy=%d) -> SM%d (prev_cost=%.1f, new_cost=%.1f)\n",
+                   i, qo_tile_idx, qo_head_idx, effective_kv_len, tile_cost, replica, num_replicas,
+                   is_dummy, cta_idx, accum_cost, accum_cost + tile_cost);
+#endif
+            cta_cost[cta_idx] = accum_cost + tile_cost;
+            cta_cost_heap.insert({cta_idx, cta_cost[cta_idx]});
+            cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
+            cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
+            cta_qo_len[cta_idx].push_back(qo_len);
+            cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
+            cta_kv_len[cta_idx].push_back(is_dummy ? 0 : kv_len);
+            cta_head_indices[cta_idx].push_back(qo_head_idx);
+            cta_batch_indices[cta_idx].push_back(i);
+            if (!is_dummy) {
+              cta_has_real_work[cta_idx] = true;
+            } else {
+              cta_has_dummy_work[cta_idx] = true;
+            }
+          }
+        }
+        vec_idx++;
       }
     }
   }
@@ -1236,9 +1404,22 @@ inline cudaError_t PrefillSM90Plan(
     cta_mech_mode_vec[cta_idx] = (max_kv >= 128) ? 0 : 1;
   }
 
-  // Per-CTA valid work: 1 if CTA has at least one work item with kv_len > 0, else 0
+  // Per-CTA dummy flag: 1 only if this CTA has dummy work and no real work (cluster padding).
+  // CTAs with no work at all (neither real nor dummy) get dummy=0, valid_work=0.
+  std::vector<uint8_t> cta_is_dummy_vec(num_sm90_ctas, 0);
+  for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+    cta_is_dummy_vec[cta_idx] = (!cta_has_real_work[cta_idx] && cta_has_dummy_work[cta_idx]) ? 1 : 0;
+  }
+
+  // Per-CTA valid work:
+  // - Real CTAs: 1 if has any work item with kv_len > 0, else 0
+  // - Dummy CTAs: 1 (must participate in cluster barriers, kernel uses dummy flag to skip compute)
   std::vector<uint8_t> cta_valid_work_vec(num_sm90_ctas, 0);
   for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+    if (cta_is_dummy_vec[cta_idx]) {
+      cta_valid_work_vec[cta_idx] = 1;  // dummy must enter kernel for cluster.sync()
+      continue;
+    }
     bool has_valid = false;
     for (IdType kv_len_val : cta_kv_len[cta_idx]) {
       if (kv_len_val > 0) {
@@ -1247,6 +1428,13 @@ inline cudaError_t PrefillSM90Plan(
       }
     }
     cta_valid_work_vec[cta_idx] = has_valid ? 1 : 0;
+  }
+
+  // Per-CTA mech mode: dummy CTAs are forced to mech2 (mode=1)
+  for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+    if (cta_is_dummy_vec[cta_idx]) {
+      cta_mech_mode_vec[cta_idx] = 1;  // mech2
+    }
   }
 
 #ifdef FLASHINFER_DEBUG_SCHEDULER
@@ -1259,8 +1447,9 @@ inline cudaError_t PrefillSM90Plan(
     }
     uint8_t mode = cta_mech_mode_vec[cta_idx];
     uint8_t valid = cta_valid_work_vec[cta_idx];
-    printf("  CTA%u: max_kv=%lld -> %s (mode=%u) valid_work=%u\n", cta_idx,
-           static_cast<long long>(max_kv), mode == 0 ? "mech1" : "mech2", mode, valid);
+    uint8_t dummy = cta_is_dummy_vec[cta_idx];
+    printf("  CTA%u: max_kv=%lld -> %s (mode=%u) valid_work=%u dummy=%u\n", cta_idx,
+           static_cast<long long>(max_kv), mode == 0 ? "mech1" : "mech2", mode, valid, dummy);
   }
   printf("==============================================\n\n");
 #endif
@@ -1269,6 +1458,8 @@ inline cudaError_t PrefillSM90Plan(
       sizeof(uint8_t) * num_sm90_ctas, 16, "batch_prefill_sm90_cta_mech_mode");
   plan_info.cta_valid_work_offset = int_allocator.aligned_alloc_offset(
       sizeof(uint8_t) * num_sm90_ctas, 16, "batch_prefill_sm90_cta_valid_work");
+  plan_info.cta_is_dummy_offset = int_allocator.aligned_alloc_offset(
+      sizeof(uint8_t) * num_sm90_ctas, 16, "batch_prefill_sm90_cta_is_dummy");
 
   IdType* qo_tile_indices_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
@@ -1299,6 +1490,10 @@ inline cudaError_t PrefillSM90Plan(
   uint8_t* cta_valid_work_h =
       GetPtrFromBaseOffset<uint8_t>(page_locked_int_buffer, plan_info.cta_valid_work_offset);
   std::copy(cta_valid_work_vec.begin(), cta_valid_work_vec.end(), cta_valid_work_h);
+
+  uint8_t* cta_is_dummy_h =
+      GetPtrFromBaseOffset<uint8_t>(page_locked_int_buffer, plan_info.cta_is_dummy_offset);
+  std::copy(cta_is_dummy_vec.begin(), cta_is_dummy_vec.end(), cta_is_dummy_h);
 
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,

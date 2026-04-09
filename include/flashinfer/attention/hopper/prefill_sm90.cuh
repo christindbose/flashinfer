@@ -671,14 +671,15 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
       params.kvsplit_mode,
       params.mech2_mode,
       params.cta_mech_mode,
-      params.cta_valid_work};
+      params.cta_valid_work,
+      params.cta_is_dummy};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.
   auto kernel =
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
                                       LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
-  
+
   // For cudaLaunchKernelEx, we need the typed kernel function pointer
   auto typed_kernel = PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
                                                LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
@@ -786,7 +787,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
       params.kvsplit_mode,
       params.mech2_mode,
       params.cta_mech_mode,
-      params.cta_valid_work};
+      params.cta_valid_work,
+      params.cta_is_dummy};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.
