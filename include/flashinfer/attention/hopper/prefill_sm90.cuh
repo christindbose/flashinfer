@@ -110,6 +110,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   }
   
   
+  
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   unsigned int clusterBlockRank = cluster.block_rank();

@@ -209,12 +209,13 @@ struct SparseCollectiveMainloop {
       kv_end = min(kv_start + kv_tiles_cluster - 1, num_kv_tiles - 1);
       kv_tile_idx = kv_end;
 
-      if (threadIdx.x == 0 && threadIdx.y == 0 && ((blockIdx.x == 0) || (blockIdx.x == 1) || (blockIdx.x == 2) || (blockIdx.x == 3))) {
-        printf("kv_start: %d kv_end: %d kv_tile_idx: %d q_tile_idx: %d qo_len: %d kv_len: %d\n", kv_start, kv_end, kv_tile_idx, q_tile_idx, qo_len, kv_len);
-      }
+      //if (threadIdx.x == 0 && threadIdx.y == 0 && ((blockIdx.x == 0) || (blockIdx.x == 1) || (blockIdx.x == 2) || (blockIdx.x == 3))) {
+      //  printf("kv_start: %d kv_end: %d kv_tile_idx: %d q_tile_idx: %d qo_len: %d kv_len: %d\n", kv_start, kv_end, kv_tile_idx, q_tile_idx, qo_len, kv_len);
+     // }
+      
     }
 
-    
+
     int swa_begin_kv_tile_idx = 0;
     if constexpr (LEFT_SLIDING_WINDOW) {
       swa_begin_kv_tile_idx = get_swa_begin_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,

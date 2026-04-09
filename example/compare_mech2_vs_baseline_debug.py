@@ -19,10 +19,18 @@ Tree structure: nodes=[1,3,9,27], contexts=[32,16,8,8]
   (27 leaf nodes, 8 tokens each)                     <- Level 3: 27 nodes, 1 seq each
 """
 
+import math
 import torch
 import flashinfer
 import argparse
-import time
+
+
+def _geom_mean_ms(times_ms):
+    n = len(times_ms)
+    if n == 0:
+        raise ValueError("times_ms must be non-empty")
+    return math.exp(sum(math.log(t) for t in times_ms) / n)
+
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Compare Mech2 vs Baseline Cascade Attention')
@@ -212,13 +220,13 @@ for name, cfg in settings.items():
     torch.cuda.synchronize()
 
     times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-    avg_ms = sum(times_ms) / len(times_ms)
+    geo_mean_ms = _geom_mean_ms(times_ms)
     min_ms = min(times_ms)
     max_ms = max(times_ms)
 
     results[name] = {
         "output": out.clone(),
-        "avg_ms": avg_ms,
+        "geo_mean_ms": geo_mean_ms,
         "min_ms": min_ms,
         "max_ms": max_ms,
     }
@@ -227,7 +235,7 @@ for name, cfg in settings.items():
     print(f"  Expected:     [{batch_size}, {num_qo_heads}, {head_dim}]")
     print(f"  Output mean:  {out.mean().item():.6f}")
     print(f"  Output std:   {out.std().item():.6f}")
-    print(f"\n  Latency (ms): avg={avg_ms:.4f}  min={min_ms:.4f}  max={max_ms:.4f}")
+    print(f"\n  Latency (ms): geo_mean={geo_mean_ms:.4f}  min={min_ms:.4f}  max={max_ms:.4f}")
 
     print(f"\n  Sample outputs (first 8 sequences):")
     for seq_id in range(min(batch_size, 8)):
@@ -259,13 +267,13 @@ mean_rel_diff = rel_diff.mean().item()
 
 print(f"\n{'Metric':<30} {'Mech2':>15} {'Baseline':>15}")
 print("-" * 62)
-print(f"{'Avg latency (ms)':<30} {results['Mech2']['avg_ms']:>15.4f} {results['Baseline']['avg_ms']:>15.4f}")
+print(f"{'Geo-mean latency (ms)':<30} {results['Mech2']['geo_mean_ms']:>15.4f} {results['Baseline']['geo_mean_ms']:>15.4f}")
 print(f"{'Min latency (ms)':<30} {results['Mech2']['min_ms']:>15.4f} {results['Baseline']['min_ms']:>15.4f}")
 print(f"{'Max latency (ms)':<30} {results['Mech2']['max_ms']:>15.4f} {results['Baseline']['max_ms']:>15.4f}")
 print(f"{'Output mean':<30} {out_mech2.mean().item():>15.6f} {out_baseline.mean().item():>15.6f}")
 print(f"{'Output std':<30} {out_mech2.std().item():>15.6f} {out_baseline.std().item():>15.6f}")
 
-speedup = results["Baseline"]["avg_ms"] / results["Mech2"]["avg_ms"] if results["Mech2"]["avg_ms"] > 0 else float('inf')
+speedup = results["Baseline"]["geo_mean_ms"] / results["Mech2"]["geo_mean_ms"] if results["Mech2"]["geo_mean_ms"] > 0 else float('inf')
 
 print(f"\n{'Numerical Difference':<30}")
 print("-" * 62)
