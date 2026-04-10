@@ -1481,8 +1481,9 @@ inline cudaError_t PrefillSM90Plan(
 
 #ifdef FLASHINFER_DEBUG_SCHEDULER
   printf("\n--- Per-CTA mech mode (mech1=KV>=128, mech2=KV<128) ---\n");
-  printf("num_total_ctas=%d, num_sm90_ctas=%d\n", num_total_ctas, num_sm90_ctas);
-  for (uint32_t cta_idx = 0; cta_idx < num_total_ctas; ++cta_idx) {
+  printf("num_ctas_launched=%d, num_total_ctas=%d, num_sm90_ctas=%d\n",
+         plan_info.num_ctas_launched, num_total_ctas, num_sm90_ctas);
+  for (uint32_t cta_idx = 0; cta_idx < (uint32_t)plan_info.num_ctas_launched; ++cta_idx) {
     IdType max_kv = 0;
     for (IdType kv_len_val : cta_kv_len[cta_idx]) {
       max_kv = std::max(max_kv, kv_len_val);
