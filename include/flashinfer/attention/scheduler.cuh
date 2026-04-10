@@ -814,6 +814,7 @@ struct PrefillPlanSM90Info {
   int64_t cta_mech_mode_offset;
   int64_t cta_valid_work_offset;  // per-CTA: 1 = has valid work (any kv_len > 0), 0 = not
   int64_t cta_is_dummy_offset;    // per-CTA: 1 = dummy CTA for mech2 cluster padding, 0 = real
+  int num_ctas_launched;           // actual number of CTAs to launch (cluster-aligned)
   bool same_schedule_for_all_heads;
   bool kvsplit_mode;
   bool mech2_mode;
@@ -830,6 +831,7 @@ struct PrefillPlanSM90Info {
         cta_mech_mode_offset(0),
         cta_valid_work_offset(0),
         cta_is_dummy_offset(0),
+        num_ctas_launched(0),
         same_schedule_for_all_heads(false),
         kvsplit_mode(false),
         mech2_mode(false) {}
@@ -839,7 +841,7 @@ struct PrefillPlanSM90Info {
     return {qo_tile_indices_offset, qo_indptr_offset,     kv_indptr_offset,
             qo_len_offset,          kv_len_offset,        head_indices_offset,
             work_indptr_offset,     batch_indices_offset, cta_mech_mode_offset,
-            cta_valid_work_offset,  cta_is_dummy_offset,
+            cta_valid_work_offset,  cta_is_dummy_offset,  static_cast<int64_t>(num_ctas_launched),
             same_schedule_for_all_heads,
             static_cast<int64_t>(kvsplit_mode), static_cast<int64_t>(mech2_mode)};
   }
@@ -908,7 +910,7 @@ struct PrefillPlanSM90Info {
       kvsplit_mode = static_cast<bool>(vec[11]);
       mech2_mode = static_cast<bool>(vec[12]);
     } else if (vec.size() == 14) {
-      // Format with per-CTA mech, valid-work, and dummy array offsets
+      // Format with per-CTA mech, valid-work, and dummy array offsets (no num_ctas_launched)
       qo_tile_indices_offset = vec[0];
       qo_indptr_offset = vec[1];
       kv_indptr_offset = vec[2];
@@ -920,12 +922,30 @@ struct PrefillPlanSM90Info {
       cta_mech_mode_offset = vec[8];
       cta_valid_work_offset = vec[9];
       cta_is_dummy_offset = vec[10];
+      num_ctas_launched = 0;
       same_schedule_for_all_heads = vec[11];
       kvsplit_mode = static_cast<bool>(vec[12]);
       mech2_mode = static_cast<bool>(vec[13]);
+    } else if (vec.size() == 15) {
+      // Format with per-CTA mech, valid-work, dummy, and num_ctas_launched
+      qo_tile_indices_offset = vec[0];
+      qo_indptr_offset = vec[1];
+      kv_indptr_offset = vec[2];
+      qo_len_offset = vec[3];
+      kv_len_offset = vec[4];
+      head_indices_offset = vec[5];
+      work_indptr_offset = vec[6];
+      batch_indices_offset = vec[7];
+      cta_mech_mode_offset = vec[8];
+      cta_valid_work_offset = vec[9];
+      cta_is_dummy_offset = vec[10];
+      num_ctas_launched = static_cast<int>(vec[11]);
+      same_schedule_for_all_heads = vec[12];
+      kvsplit_mode = static_cast<bool>(vec[13]);
+      mech2_mode = static_cast<bool>(vec[14]);
     } else {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, 11, 12, 13 or 14, but got "
+      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 9, 11, 12, 13, 14 or 15, but got "
               << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
@@ -1139,14 +1159,20 @@ inline cudaError_t PrefillSM90Plan(
   FLASHINFER_CUDA_CALL(
       cudaDeviceGetAttribute(&num_sm90_ctas, cudaDevAttrMultiProcessorCount, device));
 
-  MinHeap cta_cost_heap(num_sm90_ctas);
-  std::vector<std::vector<IdType>> cta_qo_tile_indices(num_sm90_ctas, std::vector<IdType>()),
-      cta_qo_indptr(num_sm90_ctas, std::vector<IdType>()),
-      cta_kv_indptr(num_sm90_ctas, std::vector<IdType>()),
-      cta_qo_len(num_sm90_ctas, std::vector<IdType>()),
-      cta_kv_len(num_sm90_ctas, std::vector<IdType>()),
-      cta_head_indices(num_sm90_ctas, std::vector<IdType>()),
-      cta_batch_indices(num_sm90_ctas, std::vector<IdType>());
+  // Compute total CTAs needed: cluster groups each reserve kClusterSize CTAs,
+  // plus enough for non-cluster work (up to num_sm90_ctas).
+  constexpr int kClusterSizeForAlloc = 4;
+  int num_cluster_ctas_needed = next_cluster_group_id * kClusterSizeForAlloc;
+  int num_total_ctas = std::max(num_sm90_ctas, num_cluster_ctas_needed);
+
+  MinHeap cta_cost_heap(num_total_ctas);
+  std::vector<std::vector<IdType>> cta_qo_tile_indices(num_total_ctas, std::vector<IdType>()),
+      cta_qo_indptr(num_total_ctas, std::vector<IdType>()),
+      cta_kv_indptr(num_total_ctas, std::vector<IdType>()),
+      cta_qo_len(num_total_ctas, std::vector<IdType>()),
+      cta_kv_len(num_total_ctas, std::vector<IdType>()),
+      cta_head_indices(num_total_ctas, std::vector<IdType>()),
+      cta_batch_indices(num_total_ctas, std::vector<IdType>());
 
   int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
@@ -1169,16 +1195,16 @@ inline cudaError_t PrefillSM90Plan(
   constexpr int kMech1NumReplicas = 4;
   constexpr int kClusterSize = 4;
   // Track which CTAs received real vs dummy work items
-  std::vector<bool> cta_has_real_work(num_sm90_ctas, false);
-  std::vector<bool> cta_has_dummy_work(num_sm90_ctas, false);
+  std::vector<bool> cta_has_real_work(num_total_ctas, false);
+  std::vector<bool> cta_has_dummy_work(num_total_ctas, false);
   // Track per-CTA accumulated cost for cluster-aligned assignment (parallel to min-heap)
-  std::vector<float> cta_cost(num_sm90_ctas, 0.0f);
+  std::vector<float> cta_cost(num_total_ctas, 0.0f);
   // Track which cluster groups have already been assigned (group_id -> base CTA)
   std::unordered_map<int, int> cluster_group_base;
 
   // Helper: find the least-loaded cluster-aligned base CTA
   auto find_best_cluster_base = [&]() -> int {
-    int num_clusters = num_sm90_ctas / kClusterSize;
+    int num_clusters = num_total_ctas / kClusterSize;
     int best_base = 0;
     float best_cost = std::numeric_limits<float>::max();
     for (int c = 0; c < num_clusters; ++c) {
@@ -1257,13 +1283,13 @@ inline cudaError_t PrefillSM90Plan(
         // Rebuild the min-heap to reflect updated costs after cluster assignment.
         // MinHeap constructor initializes all entries with cost 0, so we pop all
         // and re-insert with actual costs.
-        cta_cost_heap = MinHeap(num_sm90_ctas);
+        cta_cost_heap = MinHeap(num_total_ctas);
         // Pop all default-initialized entries
-        for (uint32_t c = 0; c < num_sm90_ctas; ++c) {
+        for (uint32_t c = 0; c < num_total_ctas; ++c) {
           cta_cost_heap.pop();
         }
         // Re-insert with actual costs
-        for (uint32_t c = 0; c < num_sm90_ctas; ++c) {
+        for (uint32_t c = 0; c < num_total_ctas; ++c) {
           cta_cost_heap.insert({static_cast<int>(c), cta_cost[c]});
         }
       } else {
@@ -1307,18 +1333,34 @@ inline cudaError_t PrefillSM90Plan(
     }
   }
 
-  std::vector<IdType> work_indptr_vec(num_sm90_ctas + 1, 0);
-  for (uint32_t i = 0; i < num_sm90_ctas; ++i) {
+  std::vector<IdType> work_indptr_vec(num_total_ctas + 1, 0);
+  for (uint32_t i = 0; i < num_total_ctas; ++i) {
     work_indptr_vec[i + 1] = work_indptr_vec[i] + cta_qo_tile_indices[i].size();
   }
   int total_num_works = work_indptr_vec.back();
 
+  // Compute actual number of CTAs needed: find highest CTA with work, round up to cluster size
+  {
+    constexpr int kClusterSizeForLaunch = 4;
+    int max_active_cta = 0;
+    for (uint32_t i = 0; i < num_total_ctas; ++i) {
+      if (!cta_qo_tile_indices[i].empty()) {
+        max_active_cta = i + 1;
+      }
+    }
+    // Round up to nearest cluster multiple
+    int num_ctas = ((max_active_cta + kClusterSizeForLaunch - 1) / kClusterSizeForLaunch) * kClusterSizeForLaunch;
+    //printf("max_active_cta: %d, num_ctas: %d\n", max_active_cta, num_ctas);
+    plan_info.num_ctas_launched = num_ctas;
+  }
+
 #ifdef FLASHINFER_DEBUG_SCHEDULER
   printf("\n--- Final SM Assignment Summary ---\n");
+  printf("num_ctas_launched=%d (num_total_ctas=%d, num_sms=%d)\n", plan_info.num_ctas_launched, num_total_ctas, num_sm90_ctas);
   printf("total_num_works=%d\n", total_num_works);
   printf("work_indptr = [");
-  for (uint32_t i = 0; i <= num_sm90_ctas; ++i) {
-    printf("%d%s", work_indptr_vec[i], i < num_sm90_ctas ? ", " : "]\n");
+  for (uint32_t i = 0; i <= num_total_ctas; ++i) {
+    printf("%d%s", work_indptr_vec[i], i < num_total_ctas ? ", " : "]\n");
   }
   
   // Print final accumulated costs per SM from the heap
@@ -1332,11 +1374,11 @@ inline cudaError_t PrefillSM90Plan(
     total_cost += cost;
   }
   printf("Cost stats: min=%.1f, max=%.1f, avg=%.1f, imbalance=%.2f%%\n",
-         min_cost, max_cost, total_cost / num_sm90_ctas, 
+         min_cost, max_cost, total_cost / num_total_ctas,
          (max_cost - min_cost) / max_cost * 100.0f);
   
   printf("\n--- CTA ID -> Work (per-CTA assignment) ---\n");
-  for (uint32_t cta_id = 0; cta_id < num_sm90_ctas; ++cta_id) {
+  for (uint32_t cta_id = 0; cta_id < num_total_ctas; ++cta_id) {
     int num_works = static_cast<int>(cta_qo_tile_indices[cta_id].size());
     if (num_works == 0) continue;
     int work_start = work_indptr_vec[cta_id];
@@ -1390,13 +1432,13 @@ inline cudaError_t PrefillSM90Plan(
   plan_info.head_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_head_indices");
   plan_info.work_indptr_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * (num_sm90_ctas + 1), 16, "batch_prefill_sm90_work_indptr");
+      sizeof(IdType) * (num_total_ctas + 1), 16, "batch_prefill_sm90_work_indptr");
   plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_batch_indices");
 
   // Per-CTA mech array: mode=0 (mech1) if max KV length for that CTA >= 128, else mode=1 (mech2)
-  std::vector<uint8_t> cta_mech_mode_vec(num_sm90_ctas, 0);
-  for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+  std::vector<uint8_t> cta_mech_mode_vec(num_total_ctas, 0);
+  for (uint32_t cta_idx = 0; cta_idx < num_total_ctas; ++cta_idx) {
     IdType max_kv = 0;
     for (IdType kv_len_val : cta_kv_len[cta_idx]) {
       max_kv = std::max(max_kv, kv_len_val);
@@ -1406,16 +1448,16 @@ inline cudaError_t PrefillSM90Plan(
 
   // Per-CTA dummy flag: 1 only if this CTA has dummy work and no real work (cluster padding).
   // CTAs with no work at all (neither real nor dummy) get dummy=0, valid_work=0.
-  std::vector<uint8_t> cta_is_dummy_vec(num_sm90_ctas, 0);
-  for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+  std::vector<uint8_t> cta_is_dummy_vec(num_total_ctas, 0);
+  for (uint32_t cta_idx = 0; cta_idx < num_total_ctas; ++cta_idx) {
     cta_is_dummy_vec[cta_idx] = (!cta_has_real_work[cta_idx] && cta_has_dummy_work[cta_idx]) ? 1 : 0;
   }
 
   // Per-CTA valid work:
   // - Real CTAs: 1 if has any work item with kv_len > 0, else 0
   // - Dummy CTAs: 1 (must participate in cluster barriers, kernel uses dummy flag to skip compute)
-  std::vector<uint8_t> cta_valid_work_vec(num_sm90_ctas, 0);
-  for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+  std::vector<uint8_t> cta_valid_work_vec(num_total_ctas, 0);
+  for (uint32_t cta_idx = 0; cta_idx < num_total_ctas; ++cta_idx) {
     if (cta_is_dummy_vec[cta_idx]) {
       cta_valid_work_vec[cta_idx] = 1;  // dummy must enter kernel for cluster.sync()
       continue;
@@ -1431,7 +1473,7 @@ inline cudaError_t PrefillSM90Plan(
   }
 
   // Per-CTA mech mode: dummy CTAs are forced to mech2 (mode=1)
-  for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+  for (uint32_t cta_idx = 0; cta_idx < num_total_ctas; ++cta_idx) {
     if (cta_is_dummy_vec[cta_idx]) {
       cta_mech_mode_vec[cta_idx] = 1;  // mech2
     }
@@ -1439,8 +1481,8 @@ inline cudaError_t PrefillSM90Plan(
 
 #ifdef FLASHINFER_DEBUG_SCHEDULER
   printf("\n--- Per-CTA mech mode (mech1=KV>=128, mech2=KV<128) ---\n");
-  printf("num_sm90_ctas=%u\n", num_sm90_ctas);
-  for (uint32_t cta_idx = 0; cta_idx < num_sm90_ctas; ++cta_idx) {
+  printf("num_total_ctas=%d, num_sm90_ctas=%d\n", num_total_ctas, num_sm90_ctas);
+  for (uint32_t cta_idx = 0; cta_idx < num_total_ctas; ++cta_idx) {
     IdType max_kv = 0;
     for (IdType kv_len_val : cta_kv_len[cta_idx]) {
       max_kv = std::max(max_kv, kv_len_val);
@@ -1455,11 +1497,11 @@ inline cudaError_t PrefillSM90Plan(
 #endif
 
   plan_info.cta_mech_mode_offset = int_allocator.aligned_alloc_offset(
-      sizeof(uint8_t) * num_sm90_ctas, 16, "batch_prefill_sm90_cta_mech_mode");
+      sizeof(uint8_t) * num_total_ctas, 16, "batch_prefill_sm90_cta_mech_mode");
   plan_info.cta_valid_work_offset = int_allocator.aligned_alloc_offset(
-      sizeof(uint8_t) * num_sm90_ctas, 16, "batch_prefill_sm90_cta_valid_work");
+      sizeof(uint8_t) * num_total_ctas, 16, "batch_prefill_sm90_cta_valid_work");
   plan_info.cta_is_dummy_offset = int_allocator.aligned_alloc_offset(
-      sizeof(uint8_t) * num_sm90_ctas, 16, "batch_prefill_sm90_cta_is_dummy");
+      sizeof(uint8_t) * num_total_ctas, 16, "batch_prefill_sm90_cta_is_dummy");
 
   IdType* qo_tile_indices_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);

@@ -72,6 +72,7 @@ struct RaggedParams {
   uint8_t* cta_mech_mode = nullptr;  // per-CTA mech: 0 = mech1, 1 = mech2; null = use mech2_mode
   uint8_t* cta_valid_work = nullptr;  // per-CTA: 1 = valid work, 0 = not; null = assume all valid
   uint8_t* cta_is_dummy = nullptr;   // per-CTA: 1 = dummy for mech2 cluster padding, 0 = real
+  int num_ctas_launched = 0;         // cluster-aligned CTA count; 0 = use num_sm
 };
 
 struct PagedParams {
@@ -123,6 +124,7 @@ struct PagedParams {
   uint8_t* cta_mech_mode = nullptr;  // per-CTA mech: 0 = mech1, 1 = mech2; null = use mech2_mode
   uint8_t* cta_valid_work = nullptr;  // per-CTA: 1 = valid work, 0 = not; null = assume all valid
   uint8_t* cta_is_dummy = nullptr;   // per-CTA: 1 = dummy for mech2 cluster padding, 0 = real
+  int num_ctas_launched = 0;         // cluster-aligned CTA count; 0 = use num_sm
 };
 
 {{ variant_decl }}

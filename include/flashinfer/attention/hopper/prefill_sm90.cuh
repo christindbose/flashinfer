@@ -690,7 +690,8 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
       params.mech2_mode,
       params.cta_mech_mode,
       params.cta_valid_work,
-      params.cta_is_dummy};
+      params.cta_is_dummy,
+      params.num_ctas_launched};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.
@@ -806,7 +807,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
       params.mech2_mode,
       params.cta_mech_mode,
       params.cta_valid_work,
-      params.cta_is_dummy};
+      params.cta_is_dummy,
+      params.num_ctas_launched};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.

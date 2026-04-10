@@ -91,6 +91,7 @@ struct BatchPrefillPersistentTileScheduler {
     uint8_t* cta_mech_mode;
     uint8_t* cta_valid_work;  // per-CTA: 1 = valid work (any kv_len > 0), 0 = not
     uint8_t* cta_is_dummy;    // per-CTA: 1 = dummy CTA for mech2 cluster padding, 0 = real
+    int num_ctas_launched;    // cluster-aligned CTA count from scheduler
   };
 
   // Device side kernel params
@@ -113,7 +114,10 @@ struct BatchPrefillPersistentTileScheduler {
             args.cta_is_dummy};
   }
 
-  static dim3 get_grid_dim(Arguments const& args, int num_sm) { return {(unsigned)num_sm}; }
+  static dim3 get_grid_dim(Arguments const& args, int num_sm) {
+    int grid_x = (args.num_ctas_launched > 0) ? args.num_ctas_launched : num_sm;
+    return {(unsigned)grid_x};
+  }
 
   struct WorkTileInfo {
     int q_tile_idx = 0;
@@ -224,6 +228,7 @@ struct BatchPrefillTileScheduler {
     uint8_t* cta_mech_mode;
     uint8_t* cta_valid_work;
     uint8_t* cta_is_dummy;
+    int num_ctas_launched;  // cluster-aligned CTA count from scheduler
   };
 
   // Device side kernel params
@@ -247,8 +252,8 @@ struct BatchPrefillTileScheduler {
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) {
-    //printf("num_sm: %d, args.num_qo_heads: %d\n", num_sm, args.num_qo_heads);
-    return {(unsigned)num_sm, (unsigned)args.num_qo_heads};
+    int grid_x = (args.num_ctas_launched > 0) ? args.num_ctas_launched : num_sm;
+    return {(unsigned)grid_x, (unsigned)args.num_qo_heads};
   }
 
   struct WorkTileInfo {

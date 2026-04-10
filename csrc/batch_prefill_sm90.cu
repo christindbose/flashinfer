@@ -147,6 +147,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
                                  ? GetPtrFromBaseOffset<uint8_t>(int_buffer_ptr,
                                                                   plan_info.cta_is_dummy_offset)
                                  : nullptr;
+        params.num_ctas_launched = plan_info.num_ctas_launched;
         params.qo_tile_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
         params.qo_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_indptr_offset);
@@ -260,6 +261,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
                                  ? GetPtrFromBaseOffset<uint8_t>(int_buffer_ptr,
                                                                   plan_info.cta_is_dummy_offset)
                                  : nullptr;
+        params.num_ctas_launched = plan_info.num_ctas_launched;
         params.qo_tile_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
         params.qo_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_indptr_offset);
