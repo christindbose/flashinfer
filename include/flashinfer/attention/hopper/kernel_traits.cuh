@@ -42,6 +42,8 @@ struct SharedStorageQKVO {
     cutlass::arch::ClusterBarrier barrier_r_end_mech2;
 
   };
+  // LSE storage for cross-CTA softmax reduction (CTA_Q floats)
+  alignas(16) float smem_lse[decltype(cute::size<0>(SmemLayoutO{}))::value];
 };
 
 template <bool USE_TMA_LOAD_KV, int HEAD_DIM_QK_, int HEAD_DIM_VO_, int CTA_Q_, int CTA_KV_,

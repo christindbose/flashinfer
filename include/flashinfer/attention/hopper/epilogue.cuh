@@ -393,7 +393,9 @@ struct CollectiveEpilogue {
             typename TiledMma>
   CUTLASS_DEVICE void store_new(Params const& epilogue_params, FrgTensorO const& tOrO,
                             FrgTensorLSE const& lse, SharedStorage& shared_storage,
-                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord, const int clusterBlockRank = 0, const int cluster_size = 1, const bool kvsplit_mode_or_mech2_mode = false) {
+                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord,
+                            const int clusterBlockRank = 0, const int cluster_size = 1,
+                            const bool kvsplit_mode_or_mech2_mode = false) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
@@ -407,154 +409,176 @@ struct CollectiveEpilogue {
     // Make sure all WGs have finished reading V
     cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
                                       /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
+    // Write O to shared memory
     cute::copy(smem_tiled_copy_O, tOrO_retile, tOsO);
-    cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
-    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
-      cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);    
 
-    
-    /*
-                                        
-    int write_warp_idx = NUM_WARPS - 1;
-    if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
-                                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    // Write LSE to shared memory for cross-CTA softmax reduction
+    float* smem_lse_ptr = shared_storage.smem_lse;
+    Tensor cO = cute::make_identity_tensor(select<0, 1>(TileShape_PDV{}));
+    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+    Tensor tOcO = thread_mma.partition_C(cO);
+    Tensor tOcO_row = tOcO(make_coord(_0{}, _, _0{}), _, _0{});
+    CUTE_STATIC_ASSERT_V(size(lse) == size(tOcO_row));
+
+    // Only col-0 threads write LSE to avoid duplicates
+    if (get<1>(tOcO_row(_0{})) == 0) {
+#pragma unroll
+      for (int mi = 0; mi < size(lse); ++mi) {
+        const int row = get<0>(tOcO_row(mi));
+        if (row < CTA_Q) {
+          smem_lse_ptr[row] = lse(mi);
+        }
+      }
     }
-    TiledCopyO gmem_tiled_copy_O;
-    write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
-                              select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
-                              qo_head_idx, qo_indptr, qo_len, write_warp_idx);
-    
-    */
 
-    //printf("tOrO: %f\n", tOrO(0, 0, 0));
+    cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to DSMEM
+    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+      cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
+    // Cross-CTA synchronization
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
 
-    // printf SM id through the register
-    //printf("SM id: %u\n", smid());
-
-    
-    if (clusterBlockRank == 0){
+    // All ranks arrive on barrier_r_start
+    if (clusterBlockRank == 0) {
       shared_storage.barrier_r_start.arrive();
-      //printf("arrive on cluster rank 0 SM id: %u\n", smid());
-    }
-    else {
+    } else {
       shared_storage.barrier_r_start.arrive(static_cast<uint32_t>(0), 1UL);
-      //printf("arrive on cluster rank 1 SM id: %u\n", smid());
     }
-    //shared_storage.barrier_r.arrive(1-clusterBlockRank);
 
+    static constexpr int kReductionSync = 7;
+    int valid_qo_tile_size = min(qo_len - qo_tile_idx * CTA_Q, CTA_Q);
 
-    
-    if (clusterBlockRank == 0){
-      //will implement sync later.
-      //read shared memory from cluster rank 1
-      // sync on cluster rank 1
-      
-      if ((cluster_size > 1) && (kvsplit_mode_or_mech2_mode)){
-      cutlass::ConsumerToken barrier_token =
-      static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_start.try_wait(0));
-      if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
-            //printf("barrier_token: %u SM id: %u\n",
-                  //static_cast<unsigned>(barrier_token.get()), smid());
-            shared_storage.barrier_r_start.wait(0);
-      }
-      
-      
-      
-      Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 1)), SmemLayoutO{});
-      //Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 0)), SmemLayoutO{});
-
-      // Load peer CTA's shared-memory tile (sO_1) into registers.
-      // Use partition_S for smem (source layout for reading)
-      Tensor tOsO_1 = smem_thr_copy_O.partition_S(sO_1);  // Partition shared memory (S layout - for reading)
-      Tensor tOrO_1 = make_fragment_like(tOsO_1);          // Create register fragment matching S layout
-      
-      // Copy FROM shared memory (sO_1) TO registers (tOrO_1)
-      // Use implicit auto-vectorizing copy - CUTE will vectorize if layouts are compatible
-      cute::copy(tOsO_1, tOrO_1);
-
-      //printf("tOrO_1: %f\n", static_cast<float>(tOrO_1(0, 0, 0)));
-      
-
-      for (int i = 1; i < cluster_size; i++){
-        shared_storage.barrier_r_end.arrive(static_cast<uint32_t>(i), 1UL);
-      }
-      //shared_storage.barrier_r_end.arrive(static_cast<uint32_t>(1), 1UL);
-      
-      // Reduction operations: Add tOrO_1 (from peer CTA) with local tOrO
-      // tOrO_retile is already computed above and has the same layout as tOrO_1 (both S layout)
-      // Verify sizes match
-      CUTE_STATIC_ASSERT_V(size(tOrO_1) == size(tOrO_retile));
-      
-      // Create result tensor matching tOrO_1's layout
-      Tensor tOrO_final = make_fragment_like(tOrO_1);
-      
-      // Element-wise addition using flattening and integer indexing
-      // Flatten all tensors to 1D for simple element-wise access
-      auto tOrO_1_flat = flatten(tOrO_1);
-      auto tOrO_retile_flat = flatten(tOrO_retile);
-      auto tOrO_final_flat = flatten(tOrO_final);
-      
-      CUTE_STATIC_ASSERT_V(size(tOrO_1_flat) == size(tOrO_retile_flat));
-      CUTE_STATIC_ASSERT_V(size(tOrO_1_flat) == size(tOrO_final_flat));
-      
-      CUTE_UNROLL
-      for (int i = 0; i < size(tOrO_final_flat); ++i) {
-          tOrO_final_flat(i) = tOrO_1_flat(i) + tOrO_retile_flat(i);
-      }
-      
-      //printf("tOrO_final: %f\n", static_cast<float>(tOrO_final_flat(0)));
-
-
-      //printf("tOrO_final: %f\n", static_cast<float>(tOrO_final(0, 0, 0)));
-
-    
-
-      int write_warp_idx = NUM_WARPS - 1;
-      if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-        cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
-                                          cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-      }
-      TiledCopyO gmem_tiled_copy_O;
-      // Write tOrO_final (register tensor) directly to global memory
-      write_O_new<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
-                                    select<0, 1>(TileShape_PDV{}), tOrO_final, thread_idx, qo_tile_idx,
-                                    qo_head_idx, qo_indptr, qo_len, write_warp_idx);
-    }
-    else{
-
-      int write_warp_idx = NUM_WARPS - 1;
-      if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-        cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
-                                          cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-      }
-      TiledCopyO gmem_tiled_copy_O;
-      write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
-                                select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
-                                qo_head_idx, qo_indptr, qo_len, write_warp_idx);
-
-    }  
-      
-
-
-
-      }
-      else{
-
+    if (clusterBlockRank == 0) {
+      if ((cluster_size > 1) && (kvsplit_mode_or_mech2_mode)) {
+        // Wait for all peers to have written their O and LSE to smem
         cutlass::ConsumerToken barrier_token =
-        static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_end.try_wait(0));
+          static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_start.try_wait(0));
         if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
-          //printf("barrier_token: %u SM id: %u\n",
-                //static_cast<unsigned>(barrier_token.get()), smid());
+          shared_storage.barrier_r_start.wait(0);
+        }
+
+        // Sequential reduction over all peer ranks
+        // LSE is in log2 space: lse = max * sm_scale_log2 + log2(sum)
+        // Combine: new_lse = max(a,b) + log2(exp2(a-max) + exp2(b-max))
+        // Scale: O_combined = exp2(lse_a - new_lse) * O_a + exp2(lse_b - new_lse) * O_b
+        for (int peer = 1; peer < cluster_size; peer++) {
+          // Map peer's shared memory via DSMEM
+          float* peer_lse_smem = reinterpret_cast<float*>(
+              cluster.map_shared_rank(shared_storage.smem_lse, peer));
+          Tensor sO_peer = make_tensor(
+              make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), peer)),
+              SmemLayoutO{});
+
+          // Each thread handles a subset of rows
+          for (int row = thread_idx; row < valid_qo_tile_size; row += NUM_MMA_THREADS) {
+            float lse_l = smem_lse_ptr[row];
+            float lse_p = peer_lse_smem[row];
+
+            // Log-sum-exp combination in log2 space
+            float m = fmaxf(lse_l, lse_p);
+            float new_lse = m + math::ptx_log2(exp2f(lse_l - m) + exp2f(lse_p - m));
+            float sl = exp2f(lse_l - new_lse);
+            float sp = exp2f(lse_p - new_lse);
+
+            // Update combined LSE
+            smem_lse_ptr[row] = new_lse;
+
+            // Combine O for this row with softmax correction
+            for (int col = 0; col < HEAD_DIM_VO; col++) {
+              float local_val = static_cast<float>(sO(row, col));
+              float peer_val = static_cast<float>(sO_peer(row, col));
+              sO(row, col) = static_cast<DTypeO>(local_val * sl + peer_val * sp);
+            }
+          }
+
+          // Sync consumer threads before next peer (smem_o and smem_lse must be visible)
+          cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS, kReductionSync);
+        }
+
+        // Signal all peers that reduction is complete
+        for (int i = 1; i < cluster_size; i++) {
+          shared_storage.barrier_r_end.arrive(static_cast<uint32_t>(i), 1UL);
+        }
+
+        // Write final combined LSE to global memory
+        if (epilogue_params.lse_ptr) {
+          Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr),
+                                    epilogue_params.layout_LSE);
+          Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx,
+                                                  qo_indptr, qo_len)(_, qo_tile_idx);
+          for (int row = thread_idx; row < valid_qo_tile_size; row += NUM_MMA_THREADS) {
+            gLSE(row) = smem_lse_ptr[row];
+          }
+        }
+
+        // Sync before gmem O write (reduction wrote to smem_o with different partitioning)
+        cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS, kReductionSync);
+
+        // Write final combined O from smem to gmem
+        int write_warp_idx = NUM_WARPS - 1;
+        if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
+          cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+                                            cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        }
+        TiledCopyO gmem_tiled_copy_O;
+        write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O,
+                                  epilogue_params.layout_O, select<0, 1>(TileShape_PDV{}), sO,
+                                  thread_idx, qo_tile_idx, qo_head_idx, qo_indptr, qo_len,
+                                  write_warp_idx);
+      } else {
+        // No cross-CTA reduction (cluster_size == 1 or not kvsplit mode)
+        // Write LSE to gmem
+        if (epilogue_params.lse_ptr) {
+          Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr),
+                                    epilogue_params.layout_LSE);
+          Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx,
+                                                  qo_indptr, qo_len)(_, qo_tile_idx);
+          if (get<1>(tOcO_row(_0{})) == 0) {
+#pragma unroll
+            for (int mi = 0; mi < size(lse); ++mi) {
+              const int row = get<0>(tOcO_row(mi));
+              if (row < valid_qo_tile_size) {
+                gLSE(row) = lse(mi);
+              }
+            }
+          }
+        }
+
+        // Write O from smem to gmem
+        int write_warp_idx = NUM_WARPS - 1;
+        if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
+          cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+                                            cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        }
+        TiledCopyO gmem_tiled_copy_O;
+        write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O,
+                                  epilogue_params.layout_O, select<0, 1>(TileShape_PDV{}), sO,
+                                  thread_idx, qo_tile_idx, qo_head_idx, qo_indptr, qo_len,
+                                  write_warp_idx);
+      }
+    } else {
+      // Non-rank-0 CTAs: wait for rank 0 to finish reduction, then return
+      if ((cluster_size > 1) && (kvsplit_mode_or_mech2_mode)) {
+        cutlass::ConsumerToken barrier_token =
+          static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_end.try_wait(0));
+        if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
           shared_storage.barrier_r_end.wait(0);
         }
+      } else {
+        // No reduction mode: each CTA writes its own output
+        int write_warp_idx = NUM_WARPS - 1;
+        if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
+          cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+                                            cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        }
+        TiledCopyO gmem_tiled_copy_O;
+        write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O,
+                                  epilogue_params.layout_O, select<0, 1>(TileShape_PDV{}), sO,
+                                  thread_idx, qo_tile_idx, qo_head_idx, qo_indptr, qo_len,
+                                  write_warp_idx);
       }
-
-    
-
+    }
   }
 
   CUTLASS_DEVICE void store_tail() {
