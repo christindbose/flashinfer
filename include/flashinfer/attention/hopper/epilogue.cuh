@@ -8,6 +8,7 @@
 #define FLASHINFER_ATTENTION_HOPPER_EPILOGUE_CUH_
 
 #include <cutlass/cutlass.h>
+#include <type_traits>
 
 #include "../../math.cuh"
 #include "cute/tensor.hpp"
@@ -284,7 +285,9 @@ struct CollectiveEpilogue {
             typename TiledMma>
   CUTLASS_DEVICE void store_new_mech2(Params const& epilogue_params, FrgTensorO const& tOrO,
                             FrgTensorLSE const& lse, SharedStorage& shared_storage,
-                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord, const int clusterBlockRank = 0, const int cluster_size = 1, const bool mech2_mode = false, const bool is_dummy = false) {
+                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord,
+                            const int clusterBlockRank = 0, const int cluster_size = 1,
+                            const bool mech2_mode = false, const bool is_dummy = false) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
@@ -295,12 +298,35 @@ struct CollectiveEpilogue {
     Tensor tOrO_retile = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
     Tensor tOsO = smem_thr_copy_O.partition_D(sO);            // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
+    // Row coordinate mapping for LSE writes
+    float* smem_lse_ptr = shared_storage.smem_lse;
+    Tensor cO = cute::make_identity_tensor(select<0, 1>(TileShape_PDV{}));
+    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+    Tensor tOcO = thread_mma.partition_C(cO);
+    Tensor tOcO_row = tOcO(make_coord(_0{}, _, _0{}), _, _0{});
+
     if (!is_dummy) {
       // Make sure all WGs have finished reading V
       cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
                                         /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
       cute::copy(smem_tiled_copy_O, tOrO_retile, tOsO);
-      cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
+
+      // Write LSE to smem for cross-CTA softmax correction
+      if constexpr (!std::is_arithmetic_v<std::remove_reference_t<FrgTensorLSE>>) {
+        if (get<1>(tOcO_row(_0{})) == 0) {
+          constexpr int kLseSize = decltype(size(lse))::value;
+          const float* lse_data = lse.data();
+          CUTE_UNROLL
+          for (int mi = 0; mi < kLseSize; ++mi) {
+            const int row = get<0>(tOcO_row(mi));
+            if (row < CTA_Q) {
+              smem_lse_ptr[row] = lse_data[mi];
+            }
+          }
+        }
+      }
+
+      cutlass::arch::fence_view_async_shared();
       cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     }
@@ -308,28 +334,28 @@ struct CollectiveEpilogue {
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
 
-    if (clusterBlockRank == 0){
+    if (clusterBlockRank == 0) {
+      // Rank 0: make O and LSE available, then wait for peers to finish
       shared_storage.barrier_r_start_mech2.arrive();
 
-      for (int i = 1; i < cluster_size; i++){
+      for (int i = 1; i < cluster_size; i++) {
         shared_storage.barrier_r_start_mech2.arrive(static_cast<uint32_t>(i), 1UL);
       }
 
       shared_storage.barrier_r_end_mech2.arrive();
 
       cutlass::ConsumerToken barrier_token =
-      static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_end_mech2.try_wait(0));
+        static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_end_mech2.try_wait(0));
       if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
         shared_storage.barrier_r_end_mech2.wait(0);
       }
 
-    }
-    else{
+    } else {
 
       cutlass::ConsumerToken barrier_token =
-      static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_start_mech2.try_wait(0));
+        static_cast<cutlass::BarrierStatus>(shared_storage.barrier_r_start_mech2.try_wait(0));
       if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
-            shared_storage.barrier_r_start_mech2.wait(0);
+        shared_storage.barrier_r_start_mech2.wait(0);
       }
 
       if (is_dummy) {
@@ -338,44 +364,63 @@ struct CollectiveEpilogue {
         return;
       }
 
-      Tensor sO_1 = make_tensor(make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 0)), SmemLayoutO{});
+      // Read rank 0's LSE and O via DSMEM
+      float* rank0_lse_smem = reinterpret_cast<float*>(
+          cluster.map_shared_rank(shared_storage.smem_lse, 0));
+      Tensor sO_rank0 = make_tensor(
+          make_smem_ptr(cluster.map_shared_rank(shared_storage.smem_o.data(), 0)),
+          SmemLayoutO{});
 
-      // Load peer CTA's shared-memory tile (sO_1) into registers.
-      Tensor tOsO_1 = smem_thr_copy_O.partition_S(sO_1);
-      Tensor tOrO_1 = make_fragment_like(tOsO_1);
+      int valid_qo_tile_size = min(qo_len - qo_tile_idx * CTA_Q, CTA_Q);
 
-      // Copy FROM shared memory (sO_1) TO registers (tOrO_1)
-      cute::copy(tOsO_1, tOrO_1);
+      // Combine row-by-row with softmax correction in local smem_o
+      static constexpr int kReductionSync = 7;
+      for (int row = thread_idx; row < valid_qo_tile_size; row += NUM_MMA_THREADS) {
+        float lse_local = smem_lse_ptr[row];
+        float lse_rank0 = rank0_lse_smem[row];
 
-      shared_storage.barrier_r_end_mech2.arrive(static_cast<uint32_t>(0), 1UL);
+        // Log-sum-exp combination in log2 space
+        float m = fmaxf(lse_local, lse_rank0);
+        float new_lse = m + math::ptx_log2(exp2f(lse_local - m) + exp2f(lse_rank0 - m));
+        float sl = exp2f(lse_local - new_lse);
+        float sr = exp2f(lse_rank0 - new_lse);
 
-      // Reduction: Add tOrO_1 (from peer CTA) with local tOrO
-      CUTE_STATIC_ASSERT_V(size(tOrO_1) == size(tOrO_retile));
+        smem_lse_ptr[row] = new_lse;
 
-      Tensor tOrO_final = make_fragment_like(tOrO_1);
-
-      auto tOrO_1_flat = flatten(tOrO_1);
-      auto tOrO_retile_flat = flatten(tOrO_retile);
-      auto tOrO_final_flat = flatten(tOrO_final);
-
-      CUTE_STATIC_ASSERT_V(size(tOrO_1_flat) == size(tOrO_retile_flat));
-      CUTE_STATIC_ASSERT_V(size(tOrO_1_flat) == size(tOrO_final_flat));
-
-      CUTE_UNROLL
-      for (int i = 0; i < size(tOrO_final_flat); ++i) {
-          tOrO_final_flat(i) = tOrO_1_flat(i) + tOrO_retile_flat(i);
+        for (int col = 0; col < HEAD_DIM_VO; col++) {
+          float local_val = static_cast<float>(sO(row, col));
+          float rank0_val = static_cast<float>(sO_rank0(row, col));
+          sO(row, col) = static_cast<DTypeO>(local_val * sl + rank0_val * sr);
+        }
       }
 
+      // Signal rank 0 that we're done reading its smem
+      shared_storage.barrier_r_end_mech2.arrive(static_cast<uint32_t>(0), 1UL);
+
+      // Sync before gmem write (smem_o written with row-based partitioning)
+      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS, kReductionSync);
+
+      // Write combined LSE to gmem
+      if (epilogue_params.lse_ptr) {
+        Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr),
+                                  epilogue_params.layout_LSE);
+        Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx,
+                                                qo_indptr, qo_len)(_, qo_tile_idx);
+        for (int row = thread_idx; row < valid_qo_tile_size; row += NUM_MMA_THREADS) {
+          gLSE(row) = smem_lse_ptr[row];
+        }
+      }
+
+      // Write combined O from smem to gmem
       int write_warp_idx = NUM_WARPS - 1;
       if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
         cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                           cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
       }
       TiledCopyO gmem_tiled_copy_O;
-      write_O_new<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
-                                    select<0, 1>(TileShape_PDV{}), tOrO_final, thread_idx, qo_tile_idx,
-                                    qo_head_idx, qo_indptr, qo_len, write_warp_idx);
-
+      write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
+                                select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
+                                qo_head_idx, qo_indptr, qo_len, write_warp_idx);
     }
   }
 
@@ -419,14 +464,16 @@ struct CollectiveEpilogue {
     Tensor tOcO = thread_mma.partition_C(cO);
     Tensor tOcO_row = tOcO(make_coord(_0{}, _, _0{}), _, _0{});
     CUTE_STATIC_ASSERT_V(size(lse) == size(tOcO_row));
+    constexpr int kLseSize = decltype(size(lse))::value;
+    const float* lse_data = lse.data();
 
     // Only col-0 threads write LSE to avoid duplicates
     if (get<1>(tOcO_row(_0{})) == 0) {
-#pragma unroll
-      for (int mi = 0; mi < size(lse); ++mi) {
+      CUTE_UNROLL
+      for (int mi = 0; mi < kLseSize; ++mi) {
         const int row = get<0>(tOcO_row(mi));
         if (row < CTA_Q) {
-          smem_lse_ptr[row] = lse(mi);
+          smem_lse_ptr[row] = lse_data[mi];
         }
       }
     }
@@ -462,6 +509,7 @@ struct CollectiveEpilogue {
         // LSE is in log2 space: lse = max * sm_scale_log2 + log2(sum)
         // Combine: new_lse = max(a,b) + log2(exp2(a-max) + exp2(b-max))
         // Scale: O_combined = exp2(lse_a - new_lse) * O_a + exp2(lse_b - new_lse) * O_b
+        //for (int peer = 1; peer < cluster_size; peer++) {
         for (int peer = 1; peer < cluster_size; peer++) {
           // Map peer's shared memory via DSMEM
           float* peer_lse_smem = reinterpret_cast<float*>(
@@ -535,11 +583,11 @@ struct CollectiveEpilogue {
           Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx,
                                                   qo_indptr, qo_len)(_, qo_tile_idx);
           if (get<1>(tOcO_row(_0{})) == 0) {
-#pragma unroll
-            for (int mi = 0; mi < size(lse); ++mi) {
+            CUTE_UNROLL
+            for (int mi = 0; mi < kLseSize; ++mi) {
               const int row = get<0>(tOcO_row(mi));
               if (row < valid_qo_tile_size) {
-                gLSE(row) = lse(mi);
+                gLSE(row) = lse_data[mi];
               }
             }
           }
