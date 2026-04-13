@@ -1542,6 +1542,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         use_tree_walk_scheduling: bool = False,
         kvsplit_mode: bool = False,
         mech2_mode: bool = False,
+        use_pat_scheduling: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1858,6 +1859,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     ]
                     block_id += num_blocks_needed
 
+        # Pre-allocate Q permutation buffer for PAT scheduling
+        self._pat_q_perm_buf = None
+        if use_pat_scheduling:
+            max_perm_size = self._max_total_num_rows or total_num_rows
+            self._pat_q_perm_buf = torch.empty(max_perm_size, dtype=torch.int32, pin_memory=True)
+
         if self._cached_module is not None:
             # For SM90 backend (fa3/trtllm-gen), pass use_tree_walk_scheduling flag
             # Other backends will ignore it if not supported
@@ -1882,6 +1889,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         use_tree_walk_scheduling,
                         kvsplit_mode,
                         mech2_mode,
+                        use_pat_scheduling,
+                        self._block_tables.cpu().contiguous().to(torch.int32) if use_pat_scheduling and self._block_tables is not None else None,
+                        self._pat_q_perm_buf if use_pat_scheduling else None,
                     )
                 else:
                     # For other backends, call without the flag

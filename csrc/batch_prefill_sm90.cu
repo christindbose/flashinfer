@@ -46,7 +46,10 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
     at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
     int64_t head_dim_vo, bool causal, bool use_tree_walk_scheduling,
-    bool kvsplit_mode = false, bool mech2_mode = false) {
+    bool kvsplit_mode = false, bool mech2_mode = false,
+    bool use_pat_scheduling = false,
+    std::optional<at::Tensor> block_tables = std::nullopt,
+    std::optional<at::Tensor> q_perm_buf = std::nullopt) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -57,6 +60,7 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
   const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
+  int q_perm_size = 0;
   cudaError_t status =
       PrefillSM90Plan(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
                       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
@@ -64,7 +68,17 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
                       kv_indptr.data_ptr<IdType>(), kv_len_arr.data_ptr<IdType>(), total_num_rows,
                       batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
                       causal, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream,
-                      use_tree_walk_scheduling, kvsplit_mode, mech2_mode);
+                      use_tree_walk_scheduling, kvsplit_mode, mech2_mode,
+                      use_pat_scheduling,
+                      block_tables.has_value() ? block_tables->data_ptr<int32_t>() : nullptr,
+                      block_tables.has_value() ? static_cast<int>(block_tables->size(1)) : 0,
+                      block_tables.has_value() ? static_cast<int>(block_tables->size(0)) : 0,
+                      q_perm_buf.has_value() ? q_perm_buf->data_ptr<int32_t>() : nullptr,
+                      &q_perm_size);
+
+  if (q_perm_buf.has_value() && q_perm_size > 0) {
+    q_perm_buf.value().resize_({q_perm_size});
+  }
 
   TORCH_CHECK(status == cudaSuccess,
               "PrefillSM90Plan failed with error: ", cudaGetErrorString(status));

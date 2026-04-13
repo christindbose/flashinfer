@@ -420,6 +420,8 @@ class MultiLevelCascadeAttentionWrapper:
         use_tree_walk_scheduling: bool = False,
         kvsplit_mode: bool = False,
         mech2_mode: bool = False,
+        use_pat_scheduling: bool = False,
+        tree_nodes: Optional[List[int]] = None,
     ):
         r"""Create auxiliary data structures for multi-level cascade attention for multiple
         forward calls within the same decode step. Please check
@@ -482,31 +484,155 @@ class MultiLevelCascadeAttentionWrapper:
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         """
         self._mech2_mode = mech2_mode
-        for i, (
-            wrapper,
-            qo_indptr,
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
-        ) in enumerate(
-            zip(
-                self._batch_prefill_wrappers,
-                qo_indptr_arr,
-                paged_kv_indptr_arr,
-                paged_kv_indices_arr,
-                paged_kv_last_page_len,
-            )
-        ):
-            wrapper.plan(
-                qo_indptr,
-                paged_kv_indptr,
-                paged_kv_indices,
-                paged_kv_last_page_len,
+        self._use_pat_scheduling = use_pat_scheduling
+        self._pat_q_perm = None
+
+        if use_pat_scheduling and tree_nodes is not None:
+            import torch
+            from math import ceil as mceil
+
+            batch_size = tree_nodes[-1]
+            num_levels = len(tree_nodes)
+            all_kv_indptr = paged_kv_indptr_arr[0].cpu()
+            all_kv_indices = paged_kv_indices_arr[0].cpu()
+            all_kv_last_page_len = paged_kv_last_page_len[0].cpu()
+
+            # Node offsets in flat batch
+            node_offsets = []
+            off = 0
+            for level in range(num_levels):
+                node_offsets.append(off)
+                off += tree_nodes[level]
+
+            # Per-node page lists and KV lengths
+            node_page_map = {}
+            node_kv_len_map = {}
+            for level in range(num_levels):
+                for nid in range(tree_nodes[level]):
+                    flat_idx = node_offsets[level] + nid
+                    s = int(all_kv_indptr[flat_idx])
+                    e = int(all_kv_indptr[flat_idx + 1])
+                    node_page_map[flat_idx] = all_kv_indices[s:e].tolist()
+                    np_ = e - s
+                    if np_ > 0:
+                        node_kv_len_map[flat_idx] = (np_ - 1) * page_size + int(all_kv_last_page_len[flat_idx])
+                    else:
+                        node_kv_len_map[flat_idx] = 0
+
+            # Per-level context lengths
+            contexts = [node_kv_len_map[node_offsets[l]] for l in range(num_levels)]
+
+            # mm = CTA_Q / group_size
+            group_size = num_qo_heads // num_kv_heads
+            cta_q = 192 if head_dim == 64 else 128
+            mm = max(1, cta_q // group_size)
+
+            # PAT merge/split decisions per level boundary
+            merged_with_parent = [False] * num_levels
+            for level in range(1, num_levels):
+                # Find effective parent level (skip merged levels)
+                eff_parent = level - 1
+                while eff_parent > 0 and merged_with_parent[eff_parent]:
+                    eff_parent -= 1
+
+                S = batch_size // tree_nodes[level - 1]
+                child_s = batch_size // tree_nodes[level]
+                kv_len = sum(contexts[eff_parent:level])
+
+                if S == child_s:
+                    merged_with_parent[level] = True
+                else:
+                    profit = (mceil(S / mm) - mceil((S - child_s) / mm) - mceil(child_s / mm)) * kv_len + 4 * child_s
+                    if profit >= 0:
+                        merged_with_parent[level] = True
+
+            # Build fused level groups
+            fused_groups = []
+            group_start = 0
+            for level in range(1, num_levels):
+                if not merged_with_parent[level]:
+                    fused_groups.append((group_start, level))
+                    group_start = level
+            fused_groups.append((group_start, num_levels))
+
+            print(f"  [PAT] merged: {merged_with_parent}, groups: {fused_groups}, mm={mm}")
+
+            # Build boxes from fused groups
+            # Subtree granularity is at the LAST level of the group (ge-1),
+            # because that's where the KV diverges between subtrees.
+            boxes = []  # (leaf_list, page_list, kv_len)
+            for gs, ge in fused_groups:
+                last_level = ge - 1
+                seqs_per_subtree = batch_size // tree_nodes[last_level]
+                for sub_idx in range(tree_nodes[last_level]):
+                    ls = sub_idx * seqs_per_subtree
+                    le = ls + seqs_per_subtree
+
+                    # Collect pages from all levels in this fused group
+                    box_pages = []
+                    box_kv = 0
+                    for level in range(gs, ge):
+                        spn = batch_size // tree_nodes[level]
+                        nid_in_level = ls // spn
+                        fidx = node_offsets[level] + nid_in_level
+                        box_pages.extend(node_page_map[fidx])
+                        box_kv += node_kv_len_map[fidx]
+
+                    leaves = list(range(ls, le))
+                    for cs in range(0, len(leaves), mm):
+                        ce = min(cs + mm, len(leaves))
+                        boxes.append((leaves[cs:ce], box_pages, box_kv))
+
+            # Sort: kv descending, first leaf ascending, num_seqs descending
+            boxes.sort(key=lambda b: (-b[2], b[0][0], -len(b[0])))
+
+            # Summarize boxes by kv level
+            from collections import Counter
+            kv_counts = Counter(kv for _, _, kv in boxes)
+            kv_summary = ", ".join(f"{cnt}@kv={kv}" for kv, cnt in sorted(kv_counts.items(), reverse=True))
+            print(f"  [PAT] {len(boxes)} boxes: {kv_summary}")
+
+            # Build restructured page tables: one "sequence" per box
+            new_kv_indices_list = []
+            new_kv_indptr_list = [0]
+            new_kv_last_page_len_list = []
+            new_qo_indptr_list = [0]
+            q_perm = []
+
+            for leaves, pages, kv_len in boxes:
+                new_kv_indices_list.extend(pages)
+                new_kv_indptr_list.append(new_kv_indptr_list[-1] + len(pages))
+                lpl = kv_len % page_size
+                if lpl == 0 and kv_len > 0:
+                    lpl = page_size
+                new_kv_last_page_len_list.append(lpl)
+                new_qo_indptr_list.append(new_qo_indptr_list[-1] + len(leaves))
+                q_perm.extend(leaves)
+
+            device = paged_kv_indptr_arr[0].device
+            new_kv_indptr = torch.tensor(new_kv_indptr_list, dtype=torch.int32, device=device)
+            new_kv_indices = torch.tensor(new_kv_indices_list, dtype=torch.int32, device=device)
+            new_kv_last_page_len = torch.tensor(new_kv_last_page_len_list, dtype=torch.int32, device=device)
+            new_qo_indptr = torch.tensor(new_qo_indptr_list, dtype=torch.int32, device=device)
+
+            self._pat_q_perm = torch.tensor(q_perm, dtype=torch.long)
+            self._pat_num_leaves = batch_size
+
+            # Call plan with restructured data
+            # use_pat_scheduling=True disables mech1/mech2/kvsplit in the kernel
+            # block_tables=None prevents C++ from rebuilding the radix tree
+            print(f"  [PAT] Calling plan with {len(boxes)} boxes, new_qo_indptr size={new_qo_indptr.shape}")
+            import sys; sys.stdout.flush()
+            self._batch_prefill_wrappers[0].plan(
+                new_qo_indptr,
+                new_kv_indptr,
+                new_kv_indices,
+                new_kv_last_page_len,
                 num_qo_heads,
                 num_kv_heads,
                 head_dim,
                 page_size,
-                causal=causal if i == self._num_levels - 1 else False,
+                causal=False,
                 pos_encoding_mode=pos_encoding_mode,
                 use_fp16_qk_reduction=use_fp16_qk_reduction,
                 sm_scale=sm_scale,
@@ -516,10 +642,51 @@ class MultiLevelCascadeAttentionWrapper:
                 rope_theta=rope_theta,
                 q_data_type=q_data_type,
                 kv_data_type=kv_data_type,
-                use_tree_walk_scheduling=use_tree_walk_scheduling,
-                kvsplit_mode=kvsplit_mode,
-                mech2_mode=mech2_mode,
+                use_tree_walk_scheduling=False,
+                kvsplit_mode=False,
+                mech2_mode=False,
+                use_pat_scheduling=True,
+                block_tables=None,
             )
+        else:
+            for i, (
+                wrapper,
+                qo_indptr,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len_i,
+            ) in enumerate(
+                zip(
+                    self._batch_prefill_wrappers,
+                    qo_indptr_arr,
+                    paged_kv_indptr_arr,
+                    paged_kv_indices_arr,
+                    paged_kv_last_page_len,
+                )
+            ):
+                wrapper.plan(
+                    qo_indptr,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_len_i,
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size,
+                    causal=causal if i == self._num_levels - 1 else False,
+                    pos_encoding_mode=pos_encoding_mode,
+                    use_fp16_qk_reduction=use_fp16_qk_reduction,
+                    sm_scale=sm_scale,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    rope_scale=rope_scale,
+                    rope_theta=rope_theta,
+                    q_data_type=q_data_type,
+                    kv_data_type=kv_data_type,
+                    use_tree_walk_scheduling=use_tree_walk_scheduling,
+                    kvsplit_mode=kvsplit_mode,
+                    mech2_mode=mech2_mode,
+                )
     
 
 
@@ -590,6 +757,29 @@ class MultiLevelCascadeAttentionWrapper:
                 )
                 merge_state_in_place(out, lse, out_i, lse_i)
             return out
+
+        # PAT scheduling: permute Q, run kernel, merge partial results
+        if getattr(self, "_use_pat_scheduling", False) and self._pat_q_perm is not None:
+            q_permuted = q[self._pat_q_perm]
+            out, lse = self._batch_prefill_wrappers[0].run(
+                q_permuted,
+                paged_kv_cache,
+                return_lse=True,
+            )
+            # Merge partial results: each leaf appears in multiple boxes
+            # Accumulate using online softmax merge
+            num_leaves = self._pat_num_leaves
+            final_out = torch.zeros(num_leaves, q.shape[1], out.shape[2], dtype=q.dtype, device=q.device)
+            final_lse = torch.full((num_leaves, q.shape[1]), float("-inf"), dtype=torch.float32, device=q.device)
+            # Walk through permuted output and merge into per-leaf results
+            for i, leaf_idx in enumerate(self._pat_q_perm.tolist()):
+                merge_state_in_place(
+                    final_out[leaf_idx:leaf_idx+1],
+                    final_lse[leaf_idx:leaf_idx+1],
+                    out[i:i+1],
+                    lse[i:i+1],
+                )
+            return final_out
 
         # Fused path: single kernel run, then merge selected levels in Python
         out, lse = self._batch_prefill_wrappers[0].run(

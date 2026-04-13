@@ -952,6 +952,214 @@ struct PrefillPlanSM90Info {
   }
 };
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// PAT prefix tree: radix tree construction + merge/split heuristic
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct PATNode {
+  int parent = -1;
+  int s_value = 0;
+  int length = 0;
+  const int32_t* block_ptr = nullptr;
+  std::vector<int> seq_indices;
+  std::unordered_map<int, int> children;
+
+  PATNode(int p, int s, int l, const std::vector<int>& seq, const int32_t* bp)
+      : parent(p), s_value(s), length(l), seq_indices(seq), block_ptr(bp) {}
+};
+
+struct PATPackedBox {
+  std::vector<int> q_table;
+  int num_seqs_per_CTA = 0;
+  int kv_in_CTA = 0;
+};
+
+class PATPrefixTree {
+ public:
+  int block_size;
+  std::vector<PATNode> nodes;
+  int root;
+  int num_nodes = 0;
+
+  PATPrefixTree(int bs) : block_size(bs) {
+    add_node(-1, 0, 0, {}, nullptr);
+    root = 0;
+  }
+
+  int add_node(int parent, int s_value, int length,
+               const std::vector<int>& seq_indices, const int32_t* block_ptr) {
+    nodes.emplace_back(parent, s_value, length, seq_indices, block_ptr);
+    return num_nodes++;
+  }
+
+  void build_radix_tree(const int* seq_lens_ptr, const int32_t* flat_table_ptr,
+                         int num_seqs, int max_blocks) {
+    nodes.reserve(num_seqs * 2);
+    for (int i = 0; i < num_seqs; ++i) {
+      const int32_t* row_ptr = flat_table_ptr + (i * max_blocks);
+      int seq_len = seq_lens_ptr[i];
+      int block_count = (seq_len + block_size - 1) / block_size;
+      insert(i, seq_len, row_ptr, block_count);
+    }
+  }
+
+  void insert(int sId, int seq_len, const int32_t* input_blocks_ptr, int input_block_count) {
+    int node_idx = root;
+    int res_block = input_block_count;
+    int current_offset = 0;
+
+    while (res_block > 0) {
+      int first_block = input_blocks_ptr[current_offset];
+      auto it = nodes[node_idx].children.find(first_block);
+
+      if (it != nodes[node_idx].children.end()) {
+        int child_id = it->second;
+        int child_num_blocks = (nodes[child_id].length + block_size - 1) / block_size;
+        const int32_t* child_ptr = nodes[child_id].block_ptr;
+
+        int limit = std::min(child_num_blocks, res_block);
+        int common_len = 0;
+        for (int i = 0; i < limit; ++i) {
+          if (input_blocks_ptr[current_offset + i] == child_ptr[i]) {
+            common_len++;
+          } else {
+            break;
+          }
+        }
+
+        if (common_len == child_num_blocks) {
+          nodes[child_id].s_value += 1;
+          nodes[child_id].seq_indices.push_back(sId);
+          node_idx = child_id;
+          res_block -= common_len;
+          seq_len -= common_len * block_size;
+          current_offset += common_len;
+        } else {
+          std::vector<int> mid_seq = nodes[child_id].seq_indices;
+          const int32_t* mid_block_ptr = nodes[child_id].block_ptr;
+          int split_block_id = child_ptr[common_len];
+          int original_head_block = child_ptr[0];
+
+          int mid = add_node(node_idx, nodes[child_id].s_value + 1,
+                             common_len * block_size, mid_seq, mid_block_ptr);
+          nodes[mid].children[split_block_id] = child_id;
+          nodes[node_idx].children[original_head_block] = mid;
+          nodes[child_id].parent = mid;
+          nodes[child_id].block_ptr += common_len;
+          nodes[child_id].length -= common_len * block_size;
+
+          if (common_len == res_block) {
+            nodes[mid].seq_indices.push_back(sId);
+            break;
+          }
+
+          const int32_t* new_leaf_ptr = input_blocks_ptr + current_offset + common_len;
+          int new_len = seq_len - common_len * block_size;
+          int new_node_id = add_node(mid, 1, new_len, {sId}, new_leaf_ptr);
+          nodes[mid].seq_indices.push_back(sId);
+          nodes[mid].children[new_leaf_ptr[0]] = new_node_id;
+          break;
+        }
+      } else {
+        const int32_t* new_leaf_ptr = input_blocks_ptr + current_offset;
+        int new_node = add_node(node_idx, 1, seq_len, {sId}, new_leaf_ptr);
+        nodes[node_idx].children[first_block] = new_node;
+        break;
+      }
+    }
+  }
+
+  // Recursive merge/split heuristic.
+  // mm = max sequences per CTA.
+  // inherited_kv_len = accumulated KV tokens from merged ancestors.
+  std::vector<PATPackedBox> tree_heuristics(int node_id, int mm, int inherited_kv_len) {
+    std::vector<PATPackedBox> res;
+    PATNode& node = nodes[node_id];
+    int current_kv_len = inherited_kv_len + node.length;
+
+    if (node.children.empty()) {
+      int S = node.s_value;
+      for (int s = 0; s < S; s += mm) {
+        PATPackedBox box;
+        int end = std::min(s + mm, S);
+        box.q_table.assign(node.seq_indices.begin() + s, node.seq_indices.begin() + end);
+        box.num_seqs_per_CTA = box.q_table.size();
+        box.kv_in_CTA = current_kv_len;
+        res.push_back(std::move(box));
+      }
+    } else {
+      int S = node.s_value;
+      std::vector<int> ops(node.children.size(), 0);
+      std::vector<int> split_child_ids, merge_child_ids;
+
+      int idx = 0;
+      for (auto& kv : node.children) {
+        int child_id = kv.second;
+        int child_s = nodes[child_id].s_value;
+
+        // PAT profit model
+        if (S == child_s ||
+            (pat_ceil_div(S, mm) - pat_ceil_div(S - child_s, mm) -
+             pat_ceil_div(child_s, mm)) * current_kv_len + 4 * child_s >= 0) {
+          ops[idx] = 1;
+          S -= child_s;
+          merge_child_ids.push_back(child_id);
+        } else {
+          split_child_ids.push_back(child_id);
+        }
+        idx++;
+      }
+
+      if (S != 0) {
+        size_t total_seqs = node.seq_indices.size();
+        std::vector<uint8_t> is_merged(total_seqs > 0 ? *std::max_element(
+            node.seq_indices.begin(), node.seq_indices.end()) + 1 : 0, 0);
+        int c_idx = 0;
+        for (auto& kv : node.children) {
+          if (ops[c_idx] == 1) {
+            for (int sId : nodes[kv.second].seq_indices) {
+              if (sId < (int)is_merged.size()) is_merged[sId] = 1;
+            }
+          }
+          c_idx++;
+        }
+
+        std::vector<int> remaining_seqs;
+        for (int sId : node.seq_indices) {
+          if (sId >= (int)is_merged.size() || is_merged[sId] == 0)
+            remaining_seqs.push_back(sId);
+        }
+
+        for (size_t s = 0; s < remaining_seqs.size(); s += mm) {
+          PATPackedBox box;
+          size_t end = std::min(s + (size_t)mm, remaining_seqs.size());
+          box.q_table.assign(remaining_seqs.begin() + s, remaining_seqs.begin() + end);
+          box.num_seqs_per_CTA = (int)box.q_table.size();
+          box.kv_in_CTA = current_kv_len;
+          res.push_back(std::move(box));
+        }
+      }
+
+      for (int child_id : split_child_ids) {
+        auto child_boxes = tree_heuristics(child_id, mm, 0);
+        res.insert(res.end(), std::make_move_iterator(child_boxes.begin()),
+                   std::make_move_iterator(child_boxes.end()));
+      }
+      for (int child_id : merge_child_ids) {
+        auto child_boxes = tree_heuristics(child_id, mm, current_kv_len);
+        res.insert(res.end(), std::make_move_iterator(child_boxes.begin()),
+                   std::make_move_iterator(child_boxes.end()));
+      }
+    }
+    return res;
+  }
+
+ private:
+  static inline int pat_ceil_div(int a, int b) { return (a + b - 1) / b; }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename IdType>
 inline cudaError_t PrefillSM90Plan(
     void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
@@ -960,7 +1168,11 @@ inline cudaError_t PrefillSM90Plan(
     uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream,
-    bool use_tree_walk_scheduling = false, bool kvsplit_mode = false, bool mech2_mode = false) {
+    bool use_tree_walk_scheduling = false, bool kvsplit_mode = false, bool mech2_mode = false,
+    bool use_pat_scheduling = false,
+    const int32_t* block_tables_ptr = nullptr, int max_blocks_per_seq = 0,
+    int num_pat_seqs = 0,
+    int32_t* q_perm_out = nullptr, int* q_perm_size_out = nullptr) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -1164,6 +1376,10 @@ inline cudaError_t PrefillSM90Plan(
   constexpr int kClusterSizeForAlloc = 4;
   int num_cluster_ctas_needed = next_cluster_group_id * kClusterSizeForAlloc;
   int num_total_ctas = std::max(num_sm90_ctas, num_cluster_ctas_needed);
+  // PAT scheduling: need at least one CTA per batch entry (1:1 mapping)
+  if (use_pat_scheduling) {
+    num_total_ctas = std::max(num_total_ctas, static_cast<int>(batch_size));
+  }
 
   MinHeap cta_cost_heap(num_total_ctas);
   std::vector<std::vector<IdType>> cta_qo_tile_indices(num_total_ctas, std::vector<IdType>()),
@@ -1176,8 +1392,8 @@ inline cudaError_t PrefillSM90Plan(
 
   int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
-  plan_info.kvsplit_mode = kvsplit_mode;
-  plan_info.mech2_mode = mech2_mode;
+  plan_info.kvsplit_mode = use_pat_scheduling ? false : kvsplit_mode;
+  plan_info.mech2_mode = use_pat_scheduling ? false : mech2_mode;
 
 #ifdef FLASHINFER_DEBUG_SCHEDULER
   printf("\n========== FLASHINFER LOAD BALANCING ==========\n");
@@ -1190,17 +1406,243 @@ inline cudaError_t PrefillSM90Plan(
   printf("\n--- Tile Assignment ---\n");
 #endif
 
-  // When mech1 (effective_kv_len >= 128), assign the same Q tile to 4 CTAs so each CTA
-  // works on a subset of KV; the kernel handles kv_start/num_kv_tiles internally.
+  // Track which CTAs received real vs dummy work items
   constexpr int kMech1NumReplicas = 4;
   constexpr int kClusterSize = 4;
-  // Track which CTAs received real vs dummy work items
   std::vector<bool> cta_has_real_work(num_total_ctas, false);
   std::vector<bool> cta_has_dummy_work(num_total_ctas, false);
-  // Track per-CTA accumulated cost for cluster-aligned assignment (parallel to min-heap)
   std::vector<float> cta_cost(num_total_ctas, 0.0f);
-  // Track which cluster groups have already been assigned (group_id -> base CTA)
   std::unordered_map<int, int> cluster_group_base;
+
+  // ========== PAT scheduling: build fused tree from block tables ==========
+  if (use_pat_scheduling && block_tables_ptr != nullptr && num_pat_seqs > 0) {
+    const int pat_batch = num_pat_seqs;
+    const uint32_t group_size = num_qo_heads / num_kv_heads;
+    int mm = cta_tile_q / static_cast<int>(group_size);
+    if (mm < 1) mm = 1;
+
+    // Build radix tree from per-leaf block tables.
+    // kv_len_arr_h has batch_size entries (all tree nodes), but we only need
+    // the first pat_batch entries' total KV lengths. Since the block tables
+    // are per-leaf with full root-to-leaf pages, compute seq_len from page count.
+    std::vector<int> seq_lens_int(pat_batch);
+    for (int i = 0; i < pat_batch; ++i) {
+      // Count non-zero pages in this leaf's block table row
+      int num_pages = 0;
+      for (int j = 0; j < max_blocks_per_seq; ++j) {
+        if (block_tables_ptr[i * max_blocks_per_seq + j] != 0 || j == 0) {
+          num_pages = j + 1;
+        }
+      }
+      seq_lens_int[i] = num_pages * page_size;
+    }
+
+    PATPrefixTree tree(page_size);
+    tree.build_radix_tree(seq_lens_int.data(), block_tables_ptr, pat_batch, max_blocks_per_seq);
+
+    // Debug: print radix tree structure
+    {
+      printf("\n========== PAT RADIX TREE ==========\n");
+      printf("num_nodes=%d, block_size=%d\n", tree.num_nodes, tree.block_size);
+      for (int n = 0; n < tree.num_nodes; ++n) {
+        const auto& nd = tree.nodes[n];
+        printf("  Node[%d]: parent=%d, s=%d, len=%d, seqs=[", n, nd.parent, nd.s_value, nd.length);
+        for (size_t j = 0; j < nd.seq_indices.size(); ++j) {
+          printf("%d%s", nd.seq_indices[j], j + 1 < nd.seq_indices.size() ? "," : "");
+        }
+        printf("], blocks=[");
+        if (nd.block_ptr) {
+          int num_blks = (nd.length + tree.block_size - 1) / tree.block_size;
+          for (int j = 0; j < num_blks; ++j) {
+            printf("%d%s", nd.block_ptr[j], j + 1 < num_blks ? "," : "");
+          }
+        }
+        printf("], children={");
+        bool first = true;
+        for (const auto& ch : nd.children) {
+          if (!first) printf(", ");
+          printf("%d->%d", ch.first, ch.second);
+          first = false;
+        }
+        printf("}\n");
+      }
+      printf("====================================\n\n");
+    }
+
+    std::vector<PATPackedBox> packed_boxes;
+    for (const auto& kv : tree.nodes[tree.root].children) {
+      auto new_boxes = tree.tree_heuristics(kv.second, mm, 0);
+      packed_boxes.insert(packed_boxes.end(),
+                          std::make_move_iterator(new_boxes.begin()),
+                          std::make_move_iterator(new_boxes.end()));
+    }
+
+    // Sort boxes in BFS order: by kv_in_CTA descending (root first), then by first seq index
+    std::sort(packed_boxes.begin(), packed_boxes.end(),
+              [](const PATPackedBox& a, const PATPackedBox& b) {
+                if (a.kv_in_CTA != b.kv_in_CTA) return a.kv_in_CTA > b.kv_in_CTA;
+                int a_first = a.q_table.empty() ? 0 : a.q_table.front();
+                int b_first = b.q_table.empty() ? 0 : b.q_table.front();
+                if (a_first != b_first) return a_first < b_first;
+                return a.num_seqs_per_CTA > b.num_seqs_per_CTA;
+              });
+
+    // Print PAT fused tree summary (runs once during plan, not in hot path)
+    {
+      std::map<int, int> boxes_by_kv;
+      for (const auto& box : packed_boxes) boxes_by_kv[box.kv_in_CTA] += 1;
+
+      printf("\n========== PAT FUSED TREE ==========\n");
+      printf("pat_batch=%d, mm=%d, page_size=%d, total_boxes=%zu\n",
+             pat_batch, mm, page_size, packed_boxes.size());
+      printf("Fused levels (CTAs@kv): ");
+      std::vector<std::pair<int,int>> levels(boxes_by_kv.rbegin(), boxes_by_kv.rend());
+      for (size_t i = 0; i < levels.size(); ++i) {
+        printf("%d@kv=%d%s", levels[i].second, levels[i].first,
+               i + 1 < levels.size() ? ", " : "\n");
+      }
+      for (size_t i = 0; i < packed_boxes.size(); ++i) {
+        const auto& box = packed_boxes[i];
+        printf("  Box[%zu]: %d seqs, kv=%d, seqs=[",
+               i, box.num_seqs_per_CTA, box.kv_in_CTA);
+        for (size_t j = 0; j < box.q_table.size(); ++j) {
+          printf("%d%s", box.q_table[j], j + 1 < box.q_table.size() ? "," : "");
+        }
+        printf("]\n");
+      }
+      printf("====================================\n\n");
+    }
+
+    // Step 1: Build Q permutation — walk boxes, collect leaf indices in order
+    std::vector<int32_t> q_perm;
+    q_perm.reserve(pat_batch);
+    for (const auto& box : packed_boxes) {
+      for (int leaf_id : box.q_table) {
+        q_perm.push_back(leaf_id);
+      }
+    }
+    if (q_perm_out != nullptr) {
+      std::copy(q_perm.begin(), q_perm.end(), q_perm_out);
+    }
+    if (q_perm_size_out != nullptr) {
+      *q_perm_size_out = static_cast<int>(q_perm.size());
+    }
+
+    // Step 2+3: Build per-box work items, box[i] → CTA[i]
+    // Compute per-leaf token-level KV start offsets (cumulative sum of seq_lens)
+    // kv_indptr_h is indexed by original batch entries (all tree nodes), not leaves.
+    // We need per-leaf offsets computed from seq_lens_int.
+    std::vector<int> leaf_kv_start(pat_batch, 0);
+    for (int i = 1; i < pat_batch; ++i) {
+      leaf_kv_start[i] = leaf_kv_start[i - 1] + seq_lens_int[i - 1];
+    }
+
+    // Track per-leaf accumulated KV offset for split boxes
+    std::vector<int> leaf_kv_offset(pat_batch, 0);
+    int perm_qo_offset = 0;
+
+    for (int qo_head_idx = 0;
+         qo_head_idx < (plan_info.same_schedule_for_all_heads ? 1 : num_qo_heads);
+         ++qo_head_idx) {
+      perm_qo_offset = 0;
+      std::fill(leaf_kv_offset.begin(), leaf_kv_offset.end(), 0);
+
+      for (size_t box_idx = 0; box_idx < packed_boxes.size(); ++box_idx) {
+        const auto& box = packed_boxes[box_idx];
+        if (box.q_table.empty()) continue;
+
+        int target_cta = static_cast<int>(box_idx);
+        int fused_qo_len = box.num_seqs_per_CTA;
+        int fused_kv_len = box.kv_in_CTA;
+
+        // kv_indptr: first leaf's token-level start + accumulated offset from prior boxes
+        int first_leaf = box.q_table.front();
+        int fused_kv_indptr = leaf_kv_start[first_leaf] + leaf_kv_offset[first_leaf];
+
+        // Tile the fused Q range
+        int packed_qo_len = fused_qo_len * static_cast<int>(group_size);
+        int num_qo_tiles = ceil_div(packed_qo_len, cta_tile_q);
+        if (num_qo_tiles < 1) num_qo_tiles = 1;
+
+        for (int qo_tile_idx = 0; qo_tile_idx < num_qo_tiles; ++qo_tile_idx) {
+          cta_qo_tile_indices[target_cta].push_back(qo_tile_idx);
+          cta_qo_indptr[target_cta].push_back(perm_qo_offset);
+          cta_qo_len[target_cta].push_back(fused_qo_len);
+          cta_kv_indptr[target_cta].push_back(fused_kv_indptr);
+          cta_kv_len[target_cta].push_back(fused_kv_len);
+          cta_head_indices[target_cta].push_back(qo_head_idx);
+          cta_batch_indices[target_cta].push_back(first_leaf);
+          cta_has_real_work[target_cta] = true;
+        }
+
+        // Advance per-leaf KV offset for all leaves in this box
+        for (int leaf_id : box.q_table) {
+          leaf_kv_offset[leaf_id] += fused_kv_len;
+        }
+
+        perm_qo_offset += fused_qo_len;
+      }
+    }
+
+    // Print PAT CTA assignment
+    {
+      printf("\n========== PAT CTA ASSIGNMENT ==========\n");
+      printf("total_boxes=%zu, perm_qo_offset=%d\n", packed_boxes.size(), perm_qo_offset);
+      perm_qo_offset = 0;
+      std::fill(leaf_kv_offset.begin(), leaf_kv_offset.end(), 0);
+      for (size_t box_idx = 0; box_idx < packed_boxes.size(); ++box_idx) {
+        const auto& box = packed_boxes[box_idx];
+        if (box.q_table.empty()) continue;
+        int first_leaf = box.q_table.front();
+        int kv_off = leaf_kv_offset[first_leaf];
+        printf("  CTA%zu: qo_indptr=%d, qo_len=%d, kv_start=%d+%d=%d, kv_len=%d, seqs=[",
+               box_idx, perm_qo_offset, box.num_seqs_per_CTA,
+               leaf_kv_start[first_leaf], kv_off,
+               leaf_kv_start[first_leaf] + kv_off,
+               box.kv_in_CTA);
+        for (size_t j = 0; j < box.q_table.size(); ++j) {
+          printf("%d%s", box.q_table[j], j + 1 < box.q_table.size() ? "," : "");
+        }
+        printf("]\n");
+        for (int leaf_id : box.q_table) {
+          leaf_kv_offset[leaf_id] += box.kv_in_CTA;
+        }
+        perm_qo_offset += box.num_seqs_per_CTA;
+      }
+      printf("=========================================\n\n");
+    }
+  } else if (use_pat_scheduling) {
+    // PAT scheduling without block tables: 1:1 assignment of batch entries to CTAs.
+    // Used when Python already restructured the data (each "batch entry" = one box).
+    const uint32_t group_size = num_qo_heads / num_kv_heads;
+    for (int qo_head_idx = 0;
+         qo_head_idx < (plan_info.same_schedule_for_all_heads ? 1 : num_qo_heads);
+         ++qo_head_idx) {
+      for (uint32_t entry = 0; entry < batch_size; ++entry) {
+        int target_cta = static_cast<int>(entry);
+        int qo_start = static_cast<int>(qo_indptr_h[entry]);
+        int qo_len = static_cast<int>(qo_indptr_h[entry + 1]) - qo_start;
+        int kv_len = static_cast<int>(kv_len_arr_h[entry]);
+        int packed_qo = qo_len * static_cast<int>(group_size);
+        int num_qo_tiles = ceil_div(packed_qo, cta_tile_q);
+        if (num_qo_tiles < 1) num_qo_tiles = 1;
+
+        for (int qo_tile_idx = 0; qo_tile_idx < num_qo_tiles; ++qo_tile_idx) {
+          cta_qo_tile_indices[target_cta].push_back(qo_tile_idx);
+          cta_qo_indptr[target_cta].push_back(qo_indptr_h[entry]);
+          cta_qo_len[target_cta].push_back(qo_len);
+          cta_kv_indptr[target_cta].push_back(kv_indptr_h[entry]);
+          cta_kv_len[target_cta].push_back(kv_len);
+          cta_head_indices[target_cta].push_back(qo_head_idx);
+          cta_batch_indices[target_cta].push_back(entry);
+          cta_has_real_work[target_cta] = true;
+        }
+      }
+    }
+  }
+
+  // When mech1 (effective_kv_len >= 128), assign the same Q tile to 4 CTAs so each CTA
+  // works on a subset of KV; the kernel handles kv_start/num_kv_tiles internally.
 
   // Helper: find the least-loaded cluster-aligned base CTA
   auto find_best_cluster_base = [&]() -> int {
@@ -1499,8 +1941,14 @@ inline cudaError_t PrefillSM90Plan(
 
   plan_info.cta_mech_mode_offset = int_allocator.aligned_alloc_offset(
       sizeof(uint8_t) * num_total_ctas, 16, "batch_prefill_sm90_cta_mech_mode");
-  plan_info.cta_valid_work_offset = int_allocator.aligned_alloc_offset(
-      sizeof(uint8_t) * num_total_ctas, 16, "batch_prefill_sm90_cta_valid_work");
+  if (use_pat_scheduling) {
+    // PAT scheduling: set cta_valid_work to 0 so the kernel skips
+    // the per-CTA mech mode logic and uses global kvsplit_mode/mech2_mode (both false)
+    plan_info.cta_valid_work_offset = 0;
+  } else {
+    plan_info.cta_valid_work_offset = int_allocator.aligned_alloc_offset(
+        sizeof(uint8_t) * num_total_ctas, 16, "batch_prefill_sm90_cta_valid_work");
+  }
   plan_info.cta_is_dummy_offset = int_allocator.aligned_alloc_offset(
       sizeof(uint8_t) * num_total_ctas, 16, "batch_prefill_sm90_cta_is_dummy");
 
