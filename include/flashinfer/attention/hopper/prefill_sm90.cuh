@@ -731,7 +731,9 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
 
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeClusterDimension;
-  attribute[0].val.clusterDim.x = 4; // Cluster size in X-dimension
+  // Use cluster size 1 when neither kvsplit nor mech2 is active (PAT mode)
+  int cluster_dim = (scheduler_args.kvsplit_mode || scheduler_args.mech2_mode) ? 4 : 1;
+  attribute[0].val.clusterDim.x = cluster_dim;
   attribute[0].val.clusterDim.y = 1;
   attribute[0].val.clusterDim.z = 1;
 

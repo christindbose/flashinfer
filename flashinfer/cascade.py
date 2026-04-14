@@ -645,7 +645,7 @@ class MultiLevelCascadeAttentionWrapper:
                 use_tree_walk_scheduling=False,
                 kvsplit_mode=False,
                 mech2_mode=False,
-                use_pat_scheduling=True,
+                use_pat_scheduling=False,
                 block_tables=None,
             )
         else:
@@ -777,6 +777,9 @@ class MultiLevelCascadeAttentionWrapper:
                 paged_kv_cache,
                 return_lse=True,
             )
+            torch.cuda.synchronize()
+            print(f"  [PAT run] kernel done, out.shape={out.shape}, lse.shape={lse.shape}")
+            import sys; sys.stdout.flush()
             # Merge partial results: each leaf appears in multiple boxes
             # Accumulate using online softmax merge
             num_leaves = self._pat_num_leaves

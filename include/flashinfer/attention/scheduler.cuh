@@ -1784,7 +1784,8 @@ inline cudaError_t PrefillSM90Plan(
 
   // Compute actual number of CTAs needed: find highest CTA with work, round up to cluster size
   {
-    constexpr int kClusterSizeForLaunch = 4;
+    // PAT mode uses cluster size 1 (no DSM); normal mode uses cluster size 4
+    int kClusterSizeForLaunch = (use_pat_scheduling) ? 1 : 4;
     int max_active_cta = 0;
     for (uint32_t i = 0; i < num_total_ctas; ++i) {
       if (!cta_qo_tile_indices[i].empty()) {
@@ -1795,6 +1796,24 @@ inline cudaError_t PrefillSM90Plan(
     int num_ctas = ((max_active_cta + kClusterSizeForLaunch - 1) / kClusterSizeForLaunch) * kClusterSizeForLaunch;
     //printf("max_active_cta: %d, num_ctas: %d\n", max_active_cta, num_ctas);
     plan_info.num_ctas_launched = num_ctas;
+    // Extend arrays to cover cluster-aligned CTAs (empty CTAs need valid entries)
+    while ((int)work_indptr_vec.size() <= num_ctas) {
+      work_indptr_vec.push_back(total_num_works);
+    }
+    // Update num_total_ctas to match launched CTAs so all per-CTA arrays are sized correctly
+    if (num_ctas > num_total_ctas) {
+      cta_qo_tile_indices.resize(num_ctas);
+      cta_qo_indptr.resize(num_ctas);
+      cta_kv_indptr.resize(num_ctas);
+      cta_qo_len.resize(num_ctas);
+      cta_kv_len.resize(num_ctas);
+      cta_head_indices.resize(num_ctas);
+      cta_batch_indices.resize(num_ctas);
+      cta_has_real_work.resize(num_ctas, false);
+      cta_has_dummy_work.resize(num_ctas, false);
+      cta_cost.resize(num_ctas, 0.0f);
+      num_total_ctas = num_ctas;
+    }
   }
 
 #ifdef FLASHINFER_DEBUG_SCHEDULER
