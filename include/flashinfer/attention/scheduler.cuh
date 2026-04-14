@@ -1175,7 +1175,7 @@ inline cudaError_t PrefillSM90Plan(
       cta_batch_indices(num_total_ctas, std::vector<IdType>());
 
   int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
-  plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
+  plan_info.same_schedule_for_all_heads = true;
   plan_info.kvsplit_mode = kvsplit_mode;
   plan_info.mech2_mode = mech2_mode;
 
