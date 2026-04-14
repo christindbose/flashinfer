@@ -1639,7 +1639,7 @@ inline cudaError_t PrefillSM90Plan(
         }
       }
     }
-  }
+  } else {
 
   // When mech1 (effective_kv_len >= 128), assign the same Q tile to 4 CTAs so each CTA
   // works on a subset of KV; the kernel handles kv_start/num_kv_tiles internally.
@@ -1774,6 +1774,7 @@ inline cudaError_t PrefillSM90Plan(
       }
     }
   }
+  } // end else (non-PAT scheduling)
 
   std::vector<IdType> work_indptr_vec(num_total_ctas + 1, 0);
   for (uint32_t i = 0; i < num_total_ctas; ++i) {
@@ -1925,7 +1926,7 @@ inline cudaError_t PrefillSM90Plan(
   printf("\n--- Per-CTA mech mode (mech1=KV>=128, mech2=KV<128) ---\n");
   printf("num_ctas_launched=%d, num_total_ctas=%d, num_sm90_ctas=%d\n",
          plan_info.num_ctas_launched, num_total_ctas, num_sm90_ctas);
-  for (uint32_t cta_idx = 0; cta_idx < (uint32_t)plan_info.num_ctas_launched; ++cta_idx) {
+  for (uint32_t cta_idx = 0; cta_idx < std::min((uint32_t)plan_info.num_ctas_launched, (uint32_t)num_total_ctas); ++cta_idx) {
     IdType max_kv = 0;
     for (IdType kv_len_val : cta_kv_len[cta_idx]) {
       max_kv = std::max(max_kv, kv_len_val);

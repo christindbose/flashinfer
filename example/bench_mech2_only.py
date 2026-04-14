@@ -238,8 +238,8 @@ def main():
     parser.add_argument("--num_kv_heads", type=int, default=1, help="KV heads (default: 1)")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dim (default: 128)")
     parser.add_argument("--gqa", type=int, default=1, help="GQA ratio (default: 1)")
-    parser.add_argument("--warmup_iters", type=int, default=5, help="Warmup iterations (default: 5)")
-    parser.add_argument("--bench_iters", type=int, default=100, help="Benchmark iterations (default: 100)")
+    parser.add_argument("--warmup_iters", type=int, default=200, help="Warmup iterations (default: 200)")
+    parser.add_argument("--bench_iters", type=int, default=300, help="Benchmark iterations (default: 300)")
     parser.add_argument("--merge_every_n_levels", type=int, default=2, help="default: 2")
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Per-tree detailed prints (qo_indptr, samples, …)"

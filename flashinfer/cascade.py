@@ -761,6 +761,17 @@ class MultiLevelCascadeAttentionWrapper:
         # PAT scheduling: permute Q, run kernel, merge partial results
         if getattr(self, "_use_pat_scheduling", False) and self._pat_q_perm is not None:
             q_permuted = q[self._pat_q_perm]
+            print(f"  [PAT run] q.shape={q.shape}, q_permuted.shape={q_permuted.shape}")
+            print(f"  [PAT run] paged_kv_cache.shape={paged_kv_cache.shape}")
+            print(f"  [PAT run] q_perm range: [{self._pat_q_perm.min()}, {self._pat_q_perm.max()}]")
+            w = self._batch_prefill_wrappers[0]
+            print(f"  [PAT run] _paged_kv_indptr_buf: {w._paged_kv_indptr_buf[:10]}...")
+            print(f"  [PAT run] _paged_kv_indices_buf max: {w._paged_kv_indices_buf[:w._paged_kv_indptr_buf[-1].item()].max().item()}")
+            print(f"  [PAT run] total pages in cache: {paged_kv_cache.shape[0]}")
+            print(f"  [PAT run] _kv_lens_buffer[:10]: {w._kv_lens_buffer[:10]}")
+            print(f"  [PAT run] _qo_indptr_buf[:10]: {w._qo_indptr_buf[:10]}")
+            print(f"  [PAT run] _batch_size: {w._batch_size}")
+            import sys; sys.stdout.flush()
             out, lse = self._batch_prefill_wrappers[0].run(
                 q_permuted,
                 paged_kv_cache,
