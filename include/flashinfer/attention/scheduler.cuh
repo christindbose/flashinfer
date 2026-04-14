@@ -1743,7 +1743,7 @@ inline cudaError_t PrefillSM90Plan(
           int effective_kv_len =
               causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
                      : kv_len;
-          bool is_mech1 = (effective_kv_len >= 128);
+          bool is_mech1 = kvsplit_mode && (effective_kv_len >= 128);
           int num_replicas = is_mech1 ? kMech1NumReplicas : 1;
           float tile_cost = is_dummy ? 0.0f : cost_function(cta_tile_q, effective_kv_len);
 
