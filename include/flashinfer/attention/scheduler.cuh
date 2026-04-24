@@ -1190,10 +1190,10 @@ inline cudaError_t PrefillSM90Plan(
   printf("\n--- Tile Assignment ---\n");
 #endif
 
-  // When mech1 (effective_kv_len >= 128), assign the same Q tile to 4 CTAs so each CTA
+  // When mech1 (effective_kv_len >= 4096), assign the same Q tile to 4 CTAs so each CTA
   // works on a subset of KV; the kernel handles kv_start/num_kv_tiles internally.
-  constexpr int kMech1NumReplicas = 4;
-  constexpr int kClusterSize = 4;
+  constexpr int kMech1NumReplicas = 4; //4;
+  constexpr int kClusterSize = 4; //4;
   // Track which CTAs received real vs dummy work items
   std::vector<bool> cta_has_real_work(num_total_ctas, false);
   std::vector<bool> cta_has_dummy_work(num_total_ctas, false);
@@ -1301,7 +1301,7 @@ inline cudaError_t PrefillSM90Plan(
           int effective_kv_len =
               causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
                      : kv_len;
-          bool is_mech1 = (effective_kv_len >= 128);
+          bool is_mech1 = (effective_kv_len >= 4096);
           int num_replicas = is_mech1 ? kMech1NumReplicas : 1;
           float tile_cost = is_dummy ? 0.0f : cost_function(cta_tile_q, effective_kv_len);
 
@@ -1436,14 +1436,14 @@ inline cudaError_t PrefillSM90Plan(
   plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_batch_indices");
 
-  // Per-CTA mech array: mode=0 (mech1) if max KV length for that CTA >= 128, else mode=1 (mech2)
+  // Per-CTA mech array: mode=0 (mech1) if max KV length for that CTA >= 4096, else mode=1 (mech2)
   std::vector<uint8_t> cta_mech_mode_vec(num_total_ctas, 0);
   for (uint32_t cta_idx = 0; cta_idx < num_total_ctas; ++cta_idx) {
     IdType max_kv = 0;
     for (IdType kv_len_val : cta_kv_len[cta_idx]) {
       max_kv = std::max(max_kv, kv_len_val);
     }
-    cta_mech_mode_vec[cta_idx] = (max_kv >= 128) ? 0 : 1;
+    cta_mech_mode_vec[cta_idx] = (max_kv >= 4096) ? 0 : 1;
   }
 
   // Per-CTA dummy flag: 1 only if this CTA has dummy work and no real work (cluster padding).
@@ -1480,7 +1480,7 @@ inline cudaError_t PrefillSM90Plan(
   }
 
 #ifdef FLASHINFER_DEBUG_SCHEDULER
-  printf("\n--- Per-CTA mech mode (mech1=KV>=128, mech2=KV<128) ---\n");
+  printf("\n--- Per-CTA mech mode (mech1=KV>=4096, mech2=KV<4096) ---\n");
   printf("num_ctas_launched=%d, num_total_ctas=%d, num_sm90_ctas=%d\n",
          plan_info.num_ctas_launched, num_total_ctas, num_sm90_ctas);
   for (uint32_t cta_idx = 0; cta_idx < (uint32_t)plan_info.num_ctas_launched; ++cta_idx) {
