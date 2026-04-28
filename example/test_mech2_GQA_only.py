@@ -14,7 +14,8 @@ import flashinfer
 
 
 DEFAULT_MECH2_PAT_TREES = [
-    "1,64_128,32",
+    #"1,64_128,32",
+    "1,64_16384,32",
 ]
 
 GQA_CONFIGS = [
@@ -144,7 +145,7 @@ def run_mech2_one_tree(
         page_size,
         use_tree_walk_scheduling=True,
         kvsplit_mode=False,
-        mech2_mode=True,
+        mech2_mode=False,
     )
 
     out = wrapper.run(q, kv_cache, tree_nodes=nodes, merge_every_n_levels=merge_every)

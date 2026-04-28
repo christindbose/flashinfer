@@ -1035,7 +1035,10 @@ inline cudaError_t PrefillSM90Plan(
           }
         }
 
-        if (level_has_long_kv) {
+        // mech2 cluster grouping (parent+children grouped into clusters of 4 with dummy
+        // padding) only runs when mech2_mode is enabled at the plan level. Otherwise every
+        // level falls through the flat mech1 path even if its kv_len is below 128.
+        if (level_has_long_kv || !mech2_mode) {
           for (int node_idx : tree_levels[L]) {
             reordered_idx_qo_kv_len_vec.push_back(idx_qo_kv_len_vec[node_idx]);
             is_dummy_cta_vec.push_back(false);
@@ -1437,14 +1440,27 @@ inline cudaError_t PrefillSM90Plan(
   plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_batch_indices");
 
-  // Per-CTA mech array: mode=0 (mech1) if max KV length for that CTA >= 4096, else mode=1 (mech2)
-  std::vector<uint8_t> cta_mech_mode_vec(num_total_ctas, 0);
+  // Per-CTA mech array values:
+  //   0 = mech1, 1 = mech2, 2 = NEITHER (no mech specialization).
+  // Rule: mech1 fires only when max_kv >= 4096. Below that threshold:
+  //   - mech2_mode enabled  -> mech2 (1)
+  //   - mech2_mode disabled -> neither (2)
+  // NOTE: kernel currently treats cta_mech_mode as binary (0 vs non-zero); value 2 will
+  // alias to mech2 until the kernel grows an explicit "neither" path.
+  static constexpr uint8_t kMechMech1 = 0;
+  static constexpr uint8_t kMechMech2 = 1;
+  static constexpr uint8_t kMechNeither = 2;
+  std::vector<uint8_t> cta_mech_mode_vec(num_total_ctas, kMechMech1);
   for (uint32_t cta_idx = 0; cta_idx < num_total_ctas; ++cta_idx) {
     IdType max_kv = 0;
     for (IdType kv_len_val : cta_kv_len[cta_idx]) {
       max_kv = std::max(max_kv, kv_len_val);
     }
-    cta_mech_mode_vec[cta_idx] = (max_kv >= 4096) ? 0 : 1;
+    if (max_kv >= 4096) {
+      cta_mech_mode_vec[cta_idx] = kMechMech1;
+    } else {
+      cta_mech_mode_vec[cta_idx] = mech2_mode ? kMechMech2 : kMechNeither;
+    }
   }
 
   // Per-CTA dummy flag: 1 only if this CTA has dummy work and no real work (cluster padding).
@@ -1473,15 +1489,18 @@ inline cudaError_t PrefillSM90Plan(
     cta_valid_work_vec[cta_idx] = has_valid ? 1 : 0;
   }
 
-  // Per-CTA mech mode: dummy CTAs are forced to mech2 (mode=1)
-  for (uint32_t cta_idx = 0; cta_idx < num_total_ctas; ++cta_idx) {
-    if (cta_is_dummy_vec[cta_idx]) {
-      cta_mech_mode_vec[cta_idx] = 1;  // mech2
+  // Per-CTA mech mode: dummy CTAs are forced to mech2 (mode=1).
+  // Skip when mech2_mode is disabled — mech1-only plans should not produce mech2 CTAs.
+  if (mech2_mode) {
+    for (uint32_t cta_idx = 0; cta_idx < num_total_ctas; ++cta_idx) {
+      if (cta_is_dummy_vec[cta_idx]) {
+        cta_mech_mode_vec[cta_idx] = kMechMech2;
+      }
     }
   }
 
 #ifdef FLASHINFER_DEBUG_SCHEDULER
-  printf("\n--- Per-CTA mech mode (mech1=KV>=4096, mech2=KV<4096) ---\n");
+  printf("\n--- Per-CTA mech mode (mech1=KV>=4096; sub-4096: mech2 if mech2_mode else neither) ---\n");
   printf("num_ctas_launched=%d, num_total_ctas=%d, num_sm90_ctas=%d\n",
          plan_info.num_ctas_launched, num_total_ctas, num_sm90_ctas);
   for (uint32_t cta_idx = 0; cta_idx < (uint32_t)plan_info.num_ctas_launched; ++cta_idx) {
@@ -1492,8 +1511,10 @@ inline cudaError_t PrefillSM90Plan(
     uint8_t mode = cta_mech_mode_vec[cta_idx];
     uint8_t valid = cta_valid_work_vec[cta_idx];
     uint8_t dummy = cta_is_dummy_vec[cta_idx];
+    const char* mode_str =
+        (mode == kMechMech1) ? "mech1" : (mode == kMechMech2) ? "mech2" : "neither";
     printf("  CTA%u: max_kv=%lld -> %s (mode=%u) valid_work=%u dummy=%u\n", cta_idx,
-           static_cast<long long>(max_kv), mode == 0 ? "mech1" : "mech2", mode, valid, dummy);
+           static_cast<long long>(max_kv), mode_str, mode, valid, dummy);
   }
   printf("==============================================\n\n");
 #endif

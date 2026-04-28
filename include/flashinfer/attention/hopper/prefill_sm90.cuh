@@ -97,11 +97,18 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       kvsplit_mode = false;
     }
     else {
-      mech2_mode = (scheduler_params.cta_mech_mode != nullptr)
-                        ? (scheduler_params.cta_mech_mode[blockIdx.x] != 0)
-                        : scheduler_params.mech2_mode;
-      kvsplit_mode = !mech2_mode;
-      mech2_mode = false;
+      // Per-CTA mech mode encoding from scheduler:
+      //   0 = mech1   -> kvsplit path
+      //   1 = mech2   -> mech2 path
+      //   2 = neither -> no mech specialization (both flags false)
+      if (scheduler_params.cta_mech_mode != nullptr) {
+        uint8_t mech_mode = scheduler_params.cta_mech_mode[blockIdx.x];
+        mech2_mode   = (mech_mode == 1);
+        kvsplit_mode = (mech_mode == 0);
+      } else {
+        mech2_mode   = scheduler_params.mech2_mode;
+        kvsplit_mode = !mech2_mode;
+      }
     }
   }
   

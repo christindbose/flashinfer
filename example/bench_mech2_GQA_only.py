@@ -74,9 +74,9 @@ DEFAULT_MECH2_PAT_TREES = [
 GQA_CONFIGS = [
     # (num_qo_heads, num_kv_heads)
     #(1, 1),
-    (32,32),
+    #(32,32),
     #(32, 32),
-    #(32, 8),
+    (32, 8),
 ]
 
 
@@ -210,7 +210,7 @@ def benchmark_mech2_one_tree(
         page_size,
         use_tree_walk_scheduling=True,
         kvsplit_mode=False,
-        mech2_mode=True,
+        mech2_mode=False,
     )
 
     for _ in range(warmup_iters):
