@@ -101,6 +101,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                         ? (scheduler_params.cta_mech_mode[blockIdx.x] != 0)
                         : scheduler_params.mech2_mode;
       kvsplit_mode = !mech2_mode;
+      mech2_mode = false;
     }
   }
   
@@ -923,8 +924,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
     } else if constexpr (HEAD_DIM_VO == 128) {
       BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
-                                /*CTA_Q_=*/128, //128
-                                /*CTA_KV_=*/96,//96
+                                /*CTA_Q_=*/128, //128, //128
+                                /*CTA_KV_=*/96, //96,//96
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
