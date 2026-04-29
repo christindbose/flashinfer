@@ -222,6 +222,9 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   if ((mech2_mode) || (kvsplit_mode)) {
   cluster.sync();
   }
+  else {
+    __syncthreads();
+  }
   
   uint32_t* maybe_prefix_len_ptr = nullptr;
   if constexpr (has_maybe_prefix_len_ptr_v<decltype(mainloop_params.additional_params)>) {
