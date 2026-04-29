@@ -20,7 +20,9 @@ DEFAULT_MECH2_PAT_TREES = [
 
 GQA_CONFIGS = [
     # (num_qo_heads, num_kv_heads)
-    (32, 32),
+    #(32, 32),
+    (16, 8),
+    (32, 8),
 ]
 
 

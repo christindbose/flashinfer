@@ -219,7 +219,9 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   // We need this to guarantee that the Pipeline init is visible to all producers and consumer
   // blocks in the Cluster
   //__syncthreads();
+  if ((mech2_mode) || (kvsplit_mode)) {
   cluster.sync();
+  }
   
   uint32_t* maybe_prefix_len_ptr = nullptr;
   if constexpr (has_maybe_prefix_len_ptr_v<decltype(mainloop_params.additional_params)>) {
@@ -722,7 +724,10 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   FLASHINFER_CUDA_CALL(
       cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
   dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
-  //printf("grid_dims: %d %d %d\n", grid_dims.x, grid_dims.y, grid_dims.z);
+#ifdef FLASHINFER_DEBUG_SCHEDULER
+  printf("[prefill_sm90] kernel launch grid_dims = (x=%u, y=%u, z=%u)\n",
+         grid_dims.x, grid_dims.y, grid_dims.z);
+#endif
   static constexpr int ctaSize = KernelTraits::NUM_WARPS * 32;
   dim3 block_dims(ctaSize);
   

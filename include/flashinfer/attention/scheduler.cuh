@@ -1357,7 +1357,7 @@ inline cudaError_t PrefillSM90Plan(
     plan_info.num_ctas_launched = num_ctas;
   }
 
-  printf("num_ctas_launched=%d (num_total_ctas=%d, num_sms=%d)\n", plan_info.num_ctas_launched, num_total_ctas, num_sm90_ctas);
+  //printf("num_ctas_launched=%d (num_total_ctas=%d, num_sms=%d)\n", plan_info.num_ctas_launched, num_total_ctas, num_sm90_ctas);
 #ifdef FLASHINFER_DEBUG_SCHEDULER
   printf("\n--- Final SM Assignment Summary ---\n");
   printf("num_ctas_launched=%d (num_total_ctas=%d, num_sms=%d)\n", plan_info.num_ctas_launched, num_total_ctas, num_sm90_ctas);
