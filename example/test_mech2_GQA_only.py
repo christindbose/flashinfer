@@ -15,14 +15,16 @@ import flashinfer
 
 DEFAULT_MECH2_PAT_TREES = [
     #"1,64_128,32",
-    "1,64_16384,32",
+    #"1,64_16384,32",
+    "1_4096",
 ]
 
 GQA_CONFIGS = [
     # (num_qo_heads, num_kv_heads)
     #(32, 32),
-    (16, 8),
-    (32, 8),
+    (1,1)
+    #(16, 8),
+    #(32, 8),
 ]
 
 

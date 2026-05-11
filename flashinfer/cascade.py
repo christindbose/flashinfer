@@ -583,6 +583,7 @@ class MultiLevelCascadeAttentionWrapper:
                 q, paged_kv_cache, return_lse=True
             )
             #print(f"finished running last level")
+            #print("in cascade.py baseline")
             for i in range(self._num_levels - 1):
                 #print(f"running level {i}")
                 out_i, lse_i = self._batch_prefill_wrappers[i].run(
@@ -598,7 +599,7 @@ class MultiLevelCascadeAttentionWrapper:
             return_lse=True,
         )
 
-
+        #print("in cascade.py")
         #print(f"out shape: {out.shape}")
         #print(f"lse shape: {lse.shape}")
         #print(f"out[:10]: {out[:10]}")
