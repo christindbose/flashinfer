@@ -15,8 +15,8 @@ import flashinfer
 
 DEFAULT_MECH2_PAT_TREES = [
     #"1,64_128,32",
-    #"1,64_16384,32",
-    "1_4096",
+    "1,64_4096,32",
+    #"1_4096",
 ]
 
 GQA_CONFIGS = [

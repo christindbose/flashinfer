@@ -1304,7 +1304,7 @@ inline cudaError_t PrefillSM90Plan(
           int effective_kv_len =
               causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
                      : kv_len;
-          bool is_mech1 = (effective_kv_len >= 4096);
+          bool is_mech1 = kvsplit_mode && (effective_kv_len >= 4096);
           int num_replicas = is_mech1 ? kMech1NumReplicas : 1;
           float tile_cost = is_dummy ? 0.0f : cost_function(cta_tile_q, effective_kv_len);
 
@@ -1456,7 +1456,7 @@ inline cudaError_t PrefillSM90Plan(
     for (IdType kv_len_val : cta_kv_len[cta_idx]) {
       max_kv = std::max(max_kv, kv_len_val);
     }
-    if (max_kv >= 4096) {
+    if (max_kv >= 4096 && kvsplit_mode) {
       cta_mech_mode_vec[cta_idx] = kMechMech1;
     } else {
       cta_mech_mode_vec[cta_idx] = mech2_mode ? kMechMech2 : kMechNeither;
