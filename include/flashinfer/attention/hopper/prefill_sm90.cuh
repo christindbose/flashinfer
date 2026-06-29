@@ -21,6 +21,7 @@
 #include "../../cutlass_utils.cuh"
 #include "../../exception.h"
 #include "../mask.cuh"
+#include "cluster_config.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "epilogue.cuh"
@@ -747,7 +748,9 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
 
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeClusterDimension;
-  attribute[0].val.clusterDim.x = 4; // Cluster size in X-dimension
+  // Single source of truth: hopper/cluster_config.cuh (shared with the
+  // host-side scheduler in attention/scheduler.cuh).
+  attribute[0].val.clusterDim.x = kClusterSize;
   attribute[0].val.clusterDim.y = 1;
   attribute[0].val.clusterDim.z = 1;
 

@@ -34,6 +34,7 @@
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "heap.h"
+#include "hopper/cluster_config.cuh"
 
 namespace flashinfer {
 
@@ -1046,7 +1047,7 @@ inline cudaError_t PrefillSM90Plan(
           }
           already_output.insert(L);
         } else {
-          constexpr int kMech2ClusterSize = 4;
+          constexpr int kMech2ClusterSize = kClusterSize;
           for (size_t parent_idx = 0; parent_idx < tree_levels[L].size(); ++parent_idx) {
             int group_id = next_cluster_group_id++;
             int parent_node_idx = tree_levels[L][parent_idx];
@@ -1164,8 +1165,8 @@ inline cudaError_t PrefillSM90Plan(
 
   // Compute total CTAs needed: cluster groups each reserve kClusterSize CTAs,
   // plus enough for non-cluster work (up to num_sm90_ctas).
-  constexpr int kClusterSizeForAlloc = 4;
-  int num_cluster_ctas_needed = next_cluster_group_id * kClusterSizeForAlloc;
+  // kClusterSize is the single source of truth (hopper/cluster_config.cuh).
+  int num_cluster_ctas_needed = next_cluster_group_id * kClusterSize;
   int num_total_ctas = std::max(num_sm90_ctas, num_cluster_ctas_needed);
 
   MinHeap cta_cost_heap(num_total_ctas);
@@ -1196,7 +1197,8 @@ inline cudaError_t PrefillSM90Plan(
   // When mech1 (effective_kv_len >= 4096), assign the same Q tile to 4 CTAs so each CTA
   // works on a subset of KV; the kernel handles kv_start/num_kv_tiles internally.
   constexpr int kMech1NumReplicas = 4; //4;
-  constexpr int kClusterSize = 4; //4;
+  // kClusterSize comes from hopper/cluster_config.cuh (single source of truth,
+  // shared with the launch-time clusterDim.x in prefill_sm90.cuh).
   // Track which CTAs received real vs dummy work items
   std::vector<bool> cta_has_real_work(num_total_ctas, false);
   std::vector<bool> cta_has_dummy_work(num_total_ctas, false);
@@ -1344,7 +1346,7 @@ inline cudaError_t PrefillSM90Plan(
 
   // Compute actual number of CTAs needed: find highest CTA with work, round up to cluster size
   {
-    constexpr int kClusterSizeForLaunch = 4;
+    constexpr int kClusterSizeForLaunch = kClusterSize;
     int max_active_cta = 0;
     for (uint32_t i = 0; i < num_total_ctas; ++i) {
       if (!cta_qo_tile_indices[i].empty()) {
