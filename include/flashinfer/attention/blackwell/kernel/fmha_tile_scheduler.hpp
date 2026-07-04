@@ -75,7 +75,9 @@ struct HostPrecomputedTileScheduler {
       batch_idx = 0;
       qo_head_idx = 0;
     }
-    is_valid_ = true;
+    // A CTA with an empty work list must not execute a phantom (0,0,0) item;
+    // under cluster-coupled scheduling that would desynchronize merge barriers.
+    is_valid_ = work_ptr < work_ptr_end;
   }
 
   static Params to_underlying_arguments(Arguments const& args, KernelHardwareInfo hw_info) {

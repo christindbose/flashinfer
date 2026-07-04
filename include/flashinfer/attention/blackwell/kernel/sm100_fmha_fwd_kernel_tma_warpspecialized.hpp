@@ -31,6 +31,7 @@
 
 #include "../collective/fmha_common.hpp"
 #include "../collective/fmha_fusion.hpp"
+#include "cute/arch/cluster_sm90.hpp"
 #include "cute/arch/tmem_allocator_sm100.hpp"
 #include "cute/layout.hpp"
 #include "cutlass/arch/arch.h"
@@ -74,7 +75,8 @@ struct Sm100FmhaCtxKernelWarpspecializedSchedule {
 };
 
 template <class ProblemShapeIn, class CollectiveMainloop, class CollectiveEpilogue,
-          class TileScheduler, class KernelSchedule = Sm100FmhaCtxKernelWarpspecializedSchedule>
+          class TileScheduler, class KernelSchedule = Sm100FmhaCtxKernelWarpspecializedSchedule,
+          class KernelClusterShape = typename CollectiveMainloop::ClusterShape>
 struct Sm100FmhaFwdKernelTmaWarpspecialized {
   using TileShape = typename CollectiveMainloop::TileShape;
   using ProblemShape = ProblemShapeIn;
@@ -97,7 +99,12 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
   static const int NumWarps = KernelSchedule::NumWarps;
 
-  using ClusterShape = typename CollectiveMainloop::ClusterShape;
+  // Physical cluster the kernel is launched with (device/fmha.hpp reads this).
+  // May be larger than the mainloop's ClusterShape: the collectives keep 1-SM
+  // UMMA and non-multicast TMA, so all pipelines stay CTA-local and must be
+  // constructed with PipelineClusterShape, never ClusterShape.
+  using ClusterShape = KernelClusterShape;
+  using PipelineClusterShape = typename CollectiveMainloop::ClusterShape;
 
   using TmemAllocator = cute::TMEM::Allocator1Sm;
 
@@ -207,7 +214,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     pipeline_load_q_params.is_leader = lane_predicate && (role == WarpRole::Load);
     pipeline_load_q_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadQ;
     typename CollectiveMainloop::PipelineQ pipeline_load_q(
-        shared_storage.pipelines.load_q, pipeline_load_q_params, ClusterShape{}, cute::true_type{},
+        shared_storage.pipelines.load_q, pipeline_load_q_params, PipelineClusterShape{}, cute::true_type{},
         /*mask calc*/ cute::false_type{});
 
     typename CollectiveMainloop::PipelineK::Params pipeline_load_k_params;
@@ -225,10 +232,10 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     pipeline_load_k_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadK;
     pipeline_load_v_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadV;
     typename CollectiveMainloop::PipelineK pipeline_load_k(
-        shared_storage.pipelines.load_k, pipeline_load_k_params, ClusterShape{},
+        shared_storage.pipelines.load_k, pipeline_load_k_params, PipelineClusterShape{},
         /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::false_type{});
     typename CollectiveMainloop::PipelineV pipeline_load_v(
-        shared_storage.pipelines.load_v, pipeline_load_v_params, ClusterShape{},
+        shared_storage.pipelines.load_v, pipeline_load_v_params, PipelineClusterShape{},
         /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::false_type{});
 
     typename CollectiveMainloop::PipelineS::Params pipeline_mma_s0_params;
@@ -240,7 +247,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     }
     pipeline_mma_s0_params.consumer_arv_count = NumWarpsSoftmax * cutlass::NumThreadsPerWarp;
     typename CollectiveMainloop::PipelineS pipeline_mma_s0(
-        shared_storage.pipelines.mma_s0, pipeline_mma_s0_params, ClusterShape{},
+        shared_storage.pipelines.mma_s0, pipeline_mma_s0_params, PipelineClusterShape{},
         /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::false_type{});
 
     typename CollectiveMainloop::PipelineS::Params pipeline_mma_s1_params;
@@ -252,7 +259,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     }
     pipeline_mma_s1_params.consumer_arv_count = NumWarpsSoftmax * cutlass::NumThreadsPerWarp;
     typename CollectiveMainloop::PipelineS pipeline_mma_s1(
-        shared_storage.pipelines.mma_s1, pipeline_mma_s1_params, ClusterShape{},
+        shared_storage.pipelines.mma_s1, pipeline_mma_s1_params, PipelineClusterShape{},
         /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::false_type{});
 
     typename CollectiveMainloop::PipelineC::Params pipeline_s0_corr_params;
@@ -290,7 +297,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     }
     pipeline_mma_corr_params.consumer_arv_count = NumWarpsCorrection * cutlass::NumThreadsPerWarp;
     typename CollectiveMainloop::PipelineO pipeline_mma_corr(
-        shared_storage.pipelines.mma_corr, pipeline_mma_corr_params, ClusterShape{},
+        shared_storage.pipelines.mma_corr, pipeline_mma_corr_params, PipelineClusterShape{},
         /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::false_type{});
 
     typename CollectiveMainloop::PipelineE::Params pipeline_corr_epi_params;
@@ -320,12 +327,19 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
     __syncthreads();
 
-    pipeline_load_q.init_masks(ClusterShape{});
-    pipeline_load_k.init_masks(ClusterShape{});
-    pipeline_load_v.init_masks(ClusterShape{});
-    pipeline_mma_s0.init_masks(ClusterShape{});
-    pipeline_mma_s1.init_masks(ClusterShape{});
-    pipeline_mma_corr.init_masks(ClusterShape{});
+    // Under a physical cluster, peers' mbarrier inits must be visible before
+    // any remote arrive (needed once cross-CTA merge barriers exist).
+    if constexpr (cute::size(ClusterShape{}) > 1) {
+      cute::cluster_arrive_relaxed();
+      cute::cluster_wait();
+    }
+
+    pipeline_load_q.init_masks(PipelineClusterShape{});
+    pipeline_load_k.init_masks(PipelineClusterShape{});
+    pipeline_load_v.init_masks(PipelineClusterShape{});
+    pipeline_mma_s0.init_masks(PipelineClusterShape{});
+    pipeline_mma_s1.init_masks(PipelineClusterShape{});
+    pipeline_mma_corr.init_masks(PipelineClusterShape{});
 
     typename CollectiveMainloop::PipelineQ::PipelineState pipeline_load_q_consumer_state;
     typename CollectiveMainloop::PipelineQ::PipelineState pipeline_load_q_producer_state =
@@ -496,7 +510,9 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
         if (work_idx != 0) {
           if (lane_predicate) {
-            shared_storage.barrier_O.arrive(0, lane_predicate);
+            // Self-only arrive: the (cta_id, pred) overload maps to cluster
+            // rank 0 via mapa, which is remote under a physical cluster.
+            shared_storage.barrier_O.arrive();
           }
         }
         auto blk_coord = tile_scheduler.get_block_coord();

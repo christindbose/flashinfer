@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import logging
 import math
+import os
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
@@ -3017,6 +3018,13 @@ def fmha_varlen_plan(
     num_ctas = torch.cuda.get_device_properties(
         qo_segment_offsets.device
     ).multi_processor_count
+    # Stage-A A/B knob: when launching the SM100 fwd kernel with a physical
+    # cluster (FLASHINFER_FMHA_FORCE_CLUSTER), grid.x must be a cluster
+    # multiple; keep this in sync with the csrc dispatch and kSm100ClusterSize
+    # in include/flashinfer/attention/blackwell/cluster_config.cuh.
+    _force_cluster = int(os.environ.get("FLASHINFER_FMHA_FORCE_CLUSTER", "1"))
+    if _force_cluster > 1:
+        num_ctas = (num_ctas // _force_cluster) * _force_cluster
     work_indptr = torch.empty(
         num_ctas + 1, device=qo_segment_offsets.device, dtype=torch.int32
     )

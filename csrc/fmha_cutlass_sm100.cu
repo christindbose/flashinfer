@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cstdlib>
+
 #include <flashinfer/attention/blackwell/fmha_cutlass_sm100.cuh>
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/cutlass_utils.cuh>
@@ -88,6 +90,16 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
   int k_stride_h = k.stride(1);
   int v_stride_n = v.stride(0);
   int v_stride_h = v.stride(1);
+  int num_ctas = work_indptr.size(0) - 1;
+
+  // Stage-A A/B knob: launch with a physical cluster (no behavior change
+  // expected). The python planner rounds num_ctas to a cluster multiple when
+  // this env var is set. Values: 1 (default) or kSm100ClusterSize.
+  const char* force_cluster_env = std::getenv("FLASHINFER_FMHA_FORCE_CLUSTER");
+  int cluster_size = force_cluster_env ? std::atoi(force_cluster_env) : 1;
+  TORCH_CHECK(cluster_size == 1 || cluster_size == kSm100ClusterSize,
+              "FLASHINFER_FMHA_FORCE_CLUSTER must be 1 or ", kSm100ClusterSize, ", got ",
+              cluster_size);
 
   const c10::cuda::OptionalCUDAGuard device_guard(qo_segment_offsets.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -103,19 +115,26 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
     using TileShapePV = Shape<TILE_Q, D_VO, TILE_KV>;
     using CutlassMaskMode =
         typename std::conditional<MASK_MODE == MaskMode::kCausal, CausalMask, ResidualMask>::type;
-    auto status = run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t, TileShapeQK, TileShapePV,
-                               CutlassMaskMode>(
-        workspace_buffer.data_ptr(), static_cast<cutlass_type_in*>(q.data_ptr()),
-        static_cast<cutlass_type_in*>(k.data_ptr()), static_cast<cutlass_type_in*>(v.data_ptr()),
-        static_cast<int*>(qo_segment_offsets.data_ptr()),
-        static_cast<int*>(kv_segment_offsets.data_ptr()), static_cast<int*>(work_indptr.data_ptr()),
-        static_cast<int*>(qo_tile_indices.data_ptr()),
-        static_cast<int*>(qo_head_indices.data_ptr()), static_cast<int*>(batch_indices.data_ptr()),
-        static_cast<cutlass_type_out*>(o.data_ptr()),
-        maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr,
-        mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, q_stride_n,
-        q_stride_h, k_stride_n, k_stride_h, v_stride_n, v_stride_h, batch_size, total_qo_len,
-        total_kv_len, max_qo_len, stream);
+    auto run = [&](auto cluster_size_constant) -> cudaError_t {
+      constexpr int kClusterSize = decltype(cluster_size_constant)::value;
+      return run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t, TileShapeQK, TileShapePV,
+                          CutlassMaskMode, kClusterSize>(
+          workspace_buffer.data_ptr(), static_cast<cutlass_type_in*>(q.data_ptr()),
+          static_cast<cutlass_type_in*>(k.data_ptr()), static_cast<cutlass_type_in*>(v.data_ptr()),
+          static_cast<int*>(qo_segment_offsets.data_ptr()),
+          static_cast<int*>(kv_segment_offsets.data_ptr()),
+          static_cast<int*>(work_indptr.data_ptr()), static_cast<int*>(qo_tile_indices.data_ptr()),
+          static_cast<int*>(qo_head_indices.data_ptr()),
+          static_cast<int*>(batch_indices.data_ptr()),
+          static_cast<cutlass_type_out*>(o.data_ptr()),
+          maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr,
+          mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
+          q_stride_n, q_stride_h, k_stride_n, k_stride_h, v_stride_n, v_stride_h, batch_size,
+          total_qo_len, total_kv_len, max_qo_len, num_ctas, stream);
+    };
+    auto status = (cluster_size == kSm100ClusterSize)
+                      ? run(std::integral_constant<int, kSm100ClusterSize>{})
+                      : run(std::integral_constant<int, 1>{});
     TORCH_CHECK(status == cudaSuccess, "Cutlass FMHA forward pass failed",
                 cudaGetErrorString(status));
 

@@ -26,6 +26,7 @@
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/distribution.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
+#include "cluster_config.cuh"
 #include "device/fmha.hpp"
 #include "kernel/fmha_tile_scheduler.hpp"
 #include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
@@ -38,7 +39,7 @@ using namespace cutlass::fmha::kernel;
 using namespace cutlass::fmha::device;
 
 template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQK,
-          class TileShapePV, class ActiveMask>
+          class TileShapePV, class ActiveMask, int ClusterSize = 1>
 struct FwdRunner {
   using Element = DTypeIn;
   using ElementAccumulatorQK = float;
@@ -62,10 +63,13 @@ struct FwdRunner {
       StrideK, StrideV, ActiveMask>;
   using Epilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
       ElementOut, ElementAccumulatorPV, typename Mainloop::TileShapePV>;
+  // Physical launch cluster; the collectives stay 1-SM / non-multicast.
+  using KernelClusterShape = cute::Shape<cute::Int<ClusterSize>, _1, _1>;
   using Operation =
       cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
           ProblemShapeVarlen, Mainloop, Epilogue,
-          cutlass::fmha::kernel::HostPrecomputedTileScheduler>>;
+          cutlass::fmha::kernel::HostPrecomputedTileScheduler,
+          cutlass::fmha::kernel::Sm100FmhaCtxKernelWarpspecializedSchedule, KernelClusterShape>>;
   using LayoutQ = typename Mainloop::LayoutQ;
   using LayoutK = typename Mainloop::LayoutK;
   using LayoutV = typename Mainloop::LayoutV;
@@ -79,11 +83,19 @@ struct FwdRunner {
                          double sm_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
                          int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
-                         int total_qo_len, int total_kv_len, int max_qo_len, cudaStream_t stream) {
+                         int total_qo_len, int total_kv_len, int max_qo_len, int num_ctas,
+                         cudaStream_t stream) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
-    hw_info.sm_count =
-        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+    // Grid x-dim: one CTA per planner work list (work_indptr has num_ctas + 1
+    // entries). Must be a ClusterSize multiple or ClusterLauncher rejects it;
+    // the python planner rounds accordingly.
+    hw_info.sm_count = num_ctas;
+    if (num_ctas % ClusterSize != 0) {
+      std::cerr << "fmha_cutlass_sm100: num_ctas (" << num_ctas
+                << ") is not a multiple of ClusterSize (" << ClusterSize << ")" << std::endl;
+      return cudaErrorInvalidValue;
+    }
 
     StrideQ stride_Q;
     StrideK stride_K;
@@ -158,7 +170,7 @@ struct FwdRunner {
 };
 
 template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQK,
-          class TileShapePV, class ActiveMask>
+          class TileShapePV, class ActiveMask, int ClusterSize = 1>
 cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
                          IdType* qo_segment_offsets, IdType* kv_segment_offsets,
                          IdType* work_indptr, IdType* qo_tile_indices, IdType* qo_head_indices,
@@ -166,13 +178,16 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          double sm_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
                          int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
-                         int total_qo_len, int total_kv_len, int max_qo_len, cudaStream_t stream) {
-  return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask>::run(
-      workspace_buffer, q, k, v, qo_segment_offsets, kv_segment_offsets, work_indptr,
-      qo_tile_indices, qo_head_indices, batch_indices, o, maybe_lse, mask_mode_code, sm_scale,
-      num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, q_stride_n, q_stride_h, k_stride_n,
-      k_stride_h, v_stride_n, v_stride_h, batch_size, total_qo_len, total_kv_len, max_qo_len,
-      stream);
+                         int total_qo_len, int total_kv_len, int max_qo_len, int num_ctas,
+                         cudaStream_t stream) {
+  return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
+                   ClusterSize>::run(workspace_buffer, q, k, v, qo_segment_offsets,
+                                     kv_segment_offsets, work_indptr, qo_tile_indices,
+                                     qo_head_indices, batch_indices, o, maybe_lse, mask_mode_code,
+                                     sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
+                                     q_stride_n, q_stride_h, k_stride_n, k_stride_h, v_stride_n,
+                                     v_stride_h, batch_size, total_qo_len, total_kv_len, max_qo_len,
+                                     num_ctas, stream);
 }
 
 };  // namespace flashinfer
