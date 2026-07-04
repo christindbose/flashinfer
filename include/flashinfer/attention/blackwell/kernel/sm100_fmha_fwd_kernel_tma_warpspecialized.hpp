@@ -107,6 +107,13 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
   using ClusterShape = KernelClusterShape;
   using PipelineClusterShape = typename CollectiveMainloop::ClusterShape;
 
+  // mech1 relies on every rank of a cluster owning a non-empty KV slice
+  // (empty-slice ranks would skip the merge barriers and desynchronize them).
+  static_assert(cute::size(KernelClusterShape{}) == 1 ||
+                    flashinfer::kMech1KvLenThreshold >=
+                        cute::size(KernelClusterShape{}) * cute::size<1>(TileShape{}),
+                "kMech1KvLenThreshold must guarantee a non-empty KV slice on every cluster rank");
+
   using TmemAllocator = cute::TMEM::Allocator1Sm;
 
   struct SharedStorage {
@@ -129,6 +136,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     } pipelines;
 
     cutlass::arch::ClusterBarrier barrier_O;
+    typename CollectiveMainloop::Mech1Storage mech1;
     uint32_t tmem_base_ptr;
   };
 
@@ -359,6 +367,14 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
     if (role == WarpRole::Load && lane_predicate) {
       shared_storage.barrier_O.init(/*num_threads=*/1);
+      if constexpr (cute::size(ClusterShape{}) > 1) {
+        // mech1 merge barriers. start: all correction threads of all ranks
+        // arrive remotely at rank 0. end: rank 0's correction threads arrive
+        // remotely at each peer.
+        shared_storage.mech1.barrier_r_start.init(cute::size(ClusterShape{}) *
+                                                  NumWarpsCorrection * cutlass::NumThreadsPerWarp);
+        shared_storage.mech1.barrier_r_end.init(NumWarpsCorrection * cutlass::NumThreadsPerWarp);
+      }
     }
 
     __syncthreads();
@@ -465,6 +481,10 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     } else if (role == WarpRole::Correction) {
       cutlass::arch::warpgroup_reg_dealloc<NumRegsCorrection>();
 
+      // Parity of the mech1 merge barriers; identical per-rank item lists
+      // keep it in lockstep across the cluster.
+      uint32_t merge_phase = 0;
+
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
         auto blk_coord = tile_scheduler.get_block_coord();
@@ -493,8 +513,9 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         bool mech1_peer = mech1_active && cluster_rank != 0;
 
         if (get<1>(local_problem_shape) == 0) {  // empty KV slice on this rank
-          // Still produce (zeroed) smem_o and commit corr_epi so the
-          // Epilogue role's waits stay paired; gmem LSE writes are gated.
+          // Unreachable under mech1 (see the kMech1KvLenThreshold
+          // static_assert); still produce (zeroed) smem_o and commit
+          // corr_epi so the Epilogue role's waits stay paired.
           mainloop.correction_empty(blk_coord, params.mainloop, local_problem_shape,
                                     params.problem_shape, shared_storage.epilogue,
                                     pipeline_corr_epi, pipeline_corr_epi_producer_state, epilogue,
@@ -507,7 +528,9 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
                             pipeline_s0_corr_consumer_state, pipeline_s1_corr,
                             pipeline_s1_corr_consumer_state, pipeline_mma_corr,
                             pipeline_mma_corr_consumer_state, pipeline_corr_epi,
-                            pipeline_corr_epi_producer_state, epilogue, mech1_peer);
+                            pipeline_corr_epi_producer_state, epilogue, mech1_active,
+                            static_cast<int>(cluster_rank), cute::size(ClusterShape{}),
+                            &shared_storage.mech1, &merge_phase);
       }
 
       if constexpr (NumWarpsEpilogue == 0) {

@@ -30,6 +30,8 @@
  **************************************************************************************************/
 #pragma once
 
+#include <cooperative_groups.h>
+
 #include "cute/arch/simd_sm100.hpp"
 #include "cute/layout.hpp"
 #include "cute/tensor.hpp"
@@ -98,6 +100,17 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
+  };
+
+  // mech1 (DSM split-KV): cross-CTA merge staging. Lives in the kernel's
+  // SharedStorage OUTSIDE the mainloop/epilogue union: peers' smem_lse and
+  // smem_o are DSM-read by rank 0 while the union is otherwise idle between
+  // corr_epi production and epilogue consumption.
+  static constexpr int kMech1MergeRows = cute::size<0>(TileShape{});
+  struct Mech1Storage {
+    alignas(16) float smem_lse[kMech1MergeRows];
+    cutlass::arch::ClusterBarrier barrier_r_start;
+    cutlass::arch::ClusterBarrier barrier_r_end;
   };
 
   enum class TmemAllocation : uint32_t {
@@ -918,7 +931,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       typename PipelineC::PipelineState& pipeline_s1_c_consumer_state, PipelineO& pipeline_o,
       typename PipelineO::PipelineState& pipeline_o_consumer_state, PipelineE& pipeline_epi,
       typename PipelineE::PipelineState& pipeline_epi_producer_state, CollectiveEpilogue& epilogue,
-      bool mech1_peer = false) {
+      bool mech1_active = false, int cluster_rank = 0, int cluster_size = 1,
+      Mech1Storage* mech1 = nullptr, uint32_t* merge_phase = nullptr) {
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
@@ -1031,8 +1045,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                             typename TensorStorageEpi::SmemLayoutO{});
     Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), epilogue.params.layout_LSE);
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
-    // mech1 peers hold partials only; rank 0 owns the gmem LSE.
-    if (epilogue.params.ptr_LSE != nullptr && !mech1_peer) {
+    // Under mech1 every rank's LSE here is a slice-partial; rank 0 writes the
+    // merged LSE from mech1_merge instead.
+    if (epilogue.params.ptr_LSE != nullptr && !mech1_active) {
       int qo_tile_idx = get<0>(blk_coord);
       int qo_head_idx = get<2, 0>(blk_coord);
       int batch_idx = get<2, 1>(blk_coord);
@@ -1047,6 +1062,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         gLSE(segment_offset + row_idx, qo_head_idx) = lse;
       }
     }
+    if (mech1_active) {
+      int row0 = get<0>(tTMEM_LOADVcS(_0{}));
+      mech1->smem_lse[row0] = __log2f(tTMEM_LOADVrS(kIdxFinalRowSum)) +
+                              params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
+    }
     // correction_epilogue(params.scale_output, _0{}, sO);
 
     cutlass::arch::fence_view_async_tmem_load();
@@ -1054,7 +1074,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_o.consumer_release(pipeline_o_consumer_state);
     ++pipeline_o_consumer_state;
 
-    pipeline_epi.producer_commit(pipeline_epi_producer_state);
+    // Under mech1, hold this commit until the merge is done so the epilogue
+    // only ever TMA-stores merged data (and Load cannot reuse the unioned
+    // smem while rank 0 still DSM-reads a peer). PipelineE has 2 stages, so
+    // acquiring stage 1 below without this commit cannot deadlock.
+    auto pipeline_epi_state_o0 = pipeline_epi_producer_state;
+    if (!mech1_active) {
+      pipeline_epi.producer_commit(pipeline_epi_producer_state);
+    }
     ++pipeline_epi_producer_state;
 
     pipeline_s1_c.consumer_wait(pipeline_s1_c_consumer_state);
@@ -1070,7 +1097,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
 
-    if (epilogue.params.ptr_LSE != nullptr && !mech1_peer) {
+    if (epilogue.params.ptr_LSE != nullptr && !mech1_active) {
       int qo_tile_idx = get<0>(blk_coord);
       int qo_head_idx = get<2, 0>(blk_coord);
       int batch_idx = get<2, 1>(blk_coord);
@@ -1086,14 +1113,112 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         gLSE(segment_offset + row_idx, qo_head_idx) = lse;
       }
     }
+    if (mech1_active) {
+      int row0 = get<0>(tTMEM_LOADVcS(_0{}));
+      mech1->smem_lse[get<0>(TileShapeQK{}) + row0] =
+          __log2f(tTMEM_LOADVrS(kIdxFinalRowSum)) +
+          params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
+    }
     // correction_epilogue(params.scale_output, _1{}, sO);
     cutlass::arch::fence_view_async_tmem_load();
 
     pipeline_o.consumer_release(pipeline_o_consumer_state);
     ++pipeline_o_consumer_state;
 
+    if (mech1_active) {
+      mech1_merge(blk_coord, params, params_problem_shape, problem_shape, sO, epilogue,
+                  get<0>(tTMEM_LOADVcS(_0{})), cluster_rank, cluster_size, mech1, merge_phase);
+      pipeline_epi.producer_commit(pipeline_epi_state_o0);
+    }
+
     pipeline_epi.producer_commit(pipeline_epi_producer_state);
     ++pipeline_epi_producer_state;
+  }
+
+  // mech1 (DSM split-KV) in-cluster merge. Every rank has staged its partial
+  // O in smem_o and its log2-space partial LSE in mech1->smem_lse; rank 0
+  // pulls each peer's staging over DSM and accumulates row-wise. Each of the
+  // 128 correction threads owns row `row0` of both 128-row subtiles, so no
+  // cross-thread synchronization is needed between peer passes.
+  template <class BlkCoord, class ParamsProblemShape, class ProblemShape, class TensorO,
+            class CollectiveEpilogue>
+  CUTLASS_DEVICE void mech1_merge(BlkCoord const& blk_coord, Params const& params,
+                                  ParamsProblemShape const& params_problem_shape,
+                                  ProblemShape const& problem_shape, TensorO& sO,
+                                  CollectiveEpilogue& epilogue, int row0, int cluster_rank,
+                                  int cluster_size, Mech1Storage* mech1, uint32_t* merge_phase) {
+    using ElementOut = typename TensorO::value_type;
+    constexpr int kRowsPerSubtile = cute::size<0>(TileShapeQK{});  // 128
+
+    int qo_tile_idx = get<0>(blk_coord);
+    int qo_head_idx = get<2, 0>(blk_coord);
+    int batch_idx = get<2, 1>(blk_coord);
+    int qo_len = get<0>(problem_shape);
+
+    // Partial O/LSE smem writes precede the cluster-scope barrier arrive;
+    // the remote mbarrier arrive/wait pair orders them for rank 0's DSM reads.
+    cutlass::arch::fence_view_async_shared();
+    mech1->barrier_r_start.arrive(/*cta_id=*/0, /*pred=*/1);
+
+    if (cluster_rank != 0) {
+      mech1->barrier_r_end.wait(*merge_phase & 1);
+    } else {
+      mech1->barrier_r_start.wait(*merge_phase & 1);
+      auto cluster = cooperative_groups::this_cluster();
+      for (int peer = 1; peer < cluster_size; ++peer) {
+        float* peer_lse = static_cast<float*>(cluster.map_shared_rank(mech1->smem_lse, peer));
+        ElementOut* peer_o = cluster.map_shared_rank(cute::raw_pointer_cast(sO.data()), peer);
+        Tensor sO_peer = make_tensor(make_smem_ptr(peer_o), sO.layout());
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int sub = 0; sub < 2; ++sub) {
+          int row_idx = row0 + get<0>(TileShape{}) * qo_tile_idx + sub * kRowsPerSubtile;
+          if (row_idx >= qo_len) continue;  // avoid -inf minus -inf on padding rows
+          int lse_idx = sub * kRowsPerSubtile + row0;
+          float lse_l = mech1->smem_lse[lse_idx];
+          float lse_p = peer_lse[lse_idx];
+          float m = ::fmaxf(lse_l, lse_p);
+          float new_lse, sl, sp;
+          if (m == -cuda::std::numeric_limits<float>::infinity()) {
+            new_lse = m;
+            sl = 1.0f;
+            sp = 0.0f;
+          } else {
+            new_lse = m + ::log2f(::exp2f(lse_l - m) + ::exp2f(lse_p - m));
+            sl = ::exp2f(lse_l - new_lse);
+            sp = ::exp2f(lse_p - new_lse);
+          }
+          for (int col = 0; col < cute::size<1>(sO); ++col) {
+            float merged = sl * static_cast<float>(sO(row0, col, sub)) +
+                           sp * static_cast<float>(sO_peer(row0, col, sub));
+            sO(row0, col, sub) = static_cast<ElementOut>(merged);
+          }
+          mech1->smem_lse[lse_idx] = new_lse;
+        }
+      }
+
+      if (epilogue.params.ptr_LSE != nullptr) {
+        Tensor gLSE =
+            make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), epilogue.params.layout_LSE);
+        int segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
+        CUTLASS_PRAGMA_UNROLL
+        for (int sub = 0; sub < 2; ++sub) {
+          int row_idx = row0 + get<0>(TileShape{}) * qo_tile_idx + sub * kRowsPerSubtile;
+          if (row_idx < qo_len) {
+            gLSE(segment_offset + row_idx, qo_head_idx) =
+                mech1->smem_lse[sub * kRowsPerSubtile + row0];
+          }
+        }
+      }
+
+      // Merged sO must be visible to the TMA async proxy before the held
+      // corr_epi commits release the epilogue.
+      cutlass::arch::fence_view_async_shared();
+      for (int peer = 1; peer < cluster_size; ++peer) {
+        mech1->barrier_r_end.arrive(peer, /*pred=*/1);
+      }
+    }
+    *merge_phase ^= 1;
   }
 
   template <class BlkCoord, class ProblemShape, class ParamsProblemShape, class TensorStorageEpi,
