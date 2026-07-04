@@ -84,7 +84,11 @@ struct FwdRunner {
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
                          int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
                          int total_qo_len, int total_kv_len, int max_qo_len, int num_ctas,
-                         cudaStream_t stream) {
+                         bool kvsplit_mode, cudaStream_t stream) {
+    if (kvsplit_mode && ClusterSize == 1) {
+      std::cerr << "fmha_cutlass_sm100: kvsplit_mode requires a cluster > 1" << std::endl;
+      return cudaErrorInvalidValue;
+    }
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     // Grid x-dim: one CTA per planner work list (work_indptr has num_ctas + 1
@@ -136,6 +140,7 @@ struct FwdRunner {
         {o - max_qo_len * get<0>(stride_O), layout_O, maybe_lse, layout_LSE, max_qo_len},
         {work_indptr, qo_tile_indices, qo_head_indices, batch_indices},
         hw_info};
+    arguments.mainloop.kvsplit_mode = kvsplit_mode;
 
     Operation op;
 
@@ -179,7 +184,7 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
                          int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
                          int total_qo_len, int total_kv_len, int max_qo_len, int num_ctas,
-                         cudaStream_t stream) {
+                         bool kvsplit_mode, cudaStream_t stream) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
                    ClusterSize>::run(workspace_buffer, q, k, v, qo_segment_offsets,
                                      kv_segment_offsets, work_indptr, qo_tile_indices,
@@ -187,7 +192,7 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                                      sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
                                      q_stride_n, q_stride_h, k_stride_n, k_stride_h, v_stride_n,
                                      v_stride_h, batch_size, total_qo_len, total_kv_len, max_qo_len,
-                                     num_ctas, stream);
+                                     num_ctas, kvsplit_mode, stream);
 }
 
 };  // namespace flashinfer

@@ -76,7 +76,8 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
                          at::Tensor qo_head_indices, at::Tensor batch_indices, at::Tensor o,
                          std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
                          double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
-                         int64_t head_dim_qk, int64_t head_dim_vo, int64_t max_qo_len) {
+                         int64_t head_dim_qk, int64_t head_dim_vo, int64_t max_qo_len,
+                         bool kvsplit_mode) {
   CHECK(q.scalar_type() == k.scalar_type());
   auto scalar_type_in = q.scalar_type();
   auto scalar_type_out = o.scalar_type();
@@ -92,14 +93,18 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
   int v_stride_h = v.stride(1);
   int num_ctas = work_indptr.size(0) - 1;
 
-  // Stage-A A/B knob: launch with a physical cluster (no behavior change
-  // expected). The python planner rounds num_ctas to a cluster multiple when
-  // this env var is set. Values: 1 (default) or kSm100ClusterSize.
+  // kvsplit (mech1) requires the physical cluster. Independently,
+  // FLASHINFER_FMHA_FORCE_CLUSTER launches the vanilla path under a cluster
+  // as a stage-A A/B check (no behavior change expected). The python planner
+  // rounds num_ctas to a cluster multiple in both cases.
   const char* force_cluster_env = std::getenv("FLASHINFER_FMHA_FORCE_CLUSTER");
   int cluster_size = force_cluster_env ? std::atoi(force_cluster_env) : 1;
+  if (kvsplit_mode) cluster_size = kSm100ClusterSize;
   TORCH_CHECK(cluster_size == 1 || cluster_size == kSm100ClusterSize,
               "FLASHINFER_FMHA_FORCE_CLUSTER must be 1 or ", kSm100ClusterSize, ", got ",
               cluster_size);
+  TORCH_CHECK(!kvsplit_mode || mask_mode_code == 0,
+              "kvsplit_mode does not support causal masking yet");
 
   const c10::cuda::OptionalCUDAGuard device_guard(qo_segment_offsets.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -130,7 +135,7 @@ void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k
           maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr,
           mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
           q_stride_n, q_stride_h, k_stride_n, k_stride_h, v_stride_n, v_stride_h, batch_size,
-          total_qo_len, total_kv_len, max_qo_len, num_ctas, stream);
+          total_qo_len, total_kv_len, max_qo_len, num_ctas, kvsplit_mode, stream);
     };
     auto status = (cluster_size == kSm100ClusterSize)
                       ? run(std::integral_constant<int, kSm100ClusterSize>{})

@@ -180,6 +180,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     // scaling factor to quantize O
     float inv_scale_o = 1.0f;
+
+    // mech1 (DSM split-KV): cluster-replicated scheduling is active
+    bool kvsplit_mode = false;
   };
 
   struct Params {
@@ -189,6 +192,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     float scale_softmax_log2;
 
     float scale_output;
+
+    bool kvsplit_mode = false;
   };
 
   template <class ProblemShape>
@@ -205,7 +210,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     return Params{Load::to_underlying_arguments(problem_shape, args.load, workspace),
                   args.scale_q * args.scale_k * scale_softmax,
                   args.scale_q * args.scale_k * log2_e * scale_softmax,
-                  args.scale_v * args.inv_scale_o};
+                  args.scale_v * args.inv_scale_o, args.kvsplit_mode};
   }
 
   CUTLASS_DEVICE
@@ -911,8 +916,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       typename PipelineC::PipelineState& pipeline_s0_c_consumer_state, PipelineC& pipeline_s1_c,
       typename PipelineC::PipelineState& pipeline_s1_c_consumer_state, PipelineO& pipeline_o,
       typename PipelineO::PipelineState& pipeline_o_consumer_state, PipelineE& pipeline_epi,
-      typename PipelineE::PipelineState& pipeline_epi_producer_state,
-      CollectiveEpilogue& epilogue) {
+      typename PipelineE::PipelineState& pipeline_epi_producer_state, CollectiveEpilogue& epilogue,
+      bool mech1_peer = false) {
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
@@ -1025,7 +1030,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                             typename TensorStorageEpi::SmemLayoutO{});
     Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), epilogue.params.layout_LSE);
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
-    if (epilogue.params.ptr_LSE != nullptr) {
+    // mech1 peers hold partials only; rank 0 owns the gmem LSE.
+    if (epilogue.params.ptr_LSE != nullptr && !mech1_peer) {
       int qo_tile_idx = get<0>(blk_coord);
       int qo_head_idx = get<2, 0>(blk_coord);
       int batch_idx = get<2, 1>(blk_coord);
@@ -1063,7 +1069,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
 
-    if (epilogue.params.ptr_LSE != nullptr) {
+    if (epilogue.params.ptr_LSE != nullptr && !mech1_peer) {
       int qo_tile_idx = get<0>(blk_coord);
       int qo_head_idx = get<2, 0>(blk_coord);
       int batch_idx = get<2, 1>(blk_coord);

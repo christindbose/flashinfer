@@ -114,7 +114,8 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
   CUTLASS_DEVICE auto store(BlkCoord const& blk_coord, ProblemShape const& problem_shape,
                             Params const& params, ParamsProblemShape const& params_problem_shape,
                             TensorStorage& shared_storage, Pipeline& pipeline,
-                            typename Pipeline::PipelineState& pipeline_consumer_state) {
+                            typename Pipeline::PipelineState& pipeline_consumer_state,
+                            bool mech1_peer = false) {
     int qo_tile_idx = get<0>(blk_coord);
     int qo_head_idx = get<2, 0>(blk_coord);
     int batch_idx = get<2, 1>(blk_coord);
@@ -152,7 +153,8 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     pipeline.consumer_wait(pipeline_consumer_state);
     ++pipeline_consumer_state;
 
-    if (lane_predicate) {
+    // mech1 peers keep their partial O in smem; rank 0 owns the gmem store.
+    if (lane_predicate && !mech1_peer) {
       copy(params.tma_store_o, tOsO(_, _, _, _0{}), tOgO(_, _, _, o0_index));
     }
     tma_store_arrive();
@@ -160,7 +162,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     pipeline.consumer_wait(pipeline_consumer_state);
     ++pipeline_consumer_state;
 
-    if (lane_predicate) {
+    if (lane_predicate && !mech1_peer) {
       copy(params.tma_store_o, tOsO(_, _, _, _1{}), tOgO(_, _, _, o1_index));
     }
     tma_store_arrive();

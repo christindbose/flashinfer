@@ -29,6 +29,7 @@
  *
  **************************************************************************************************/
 
+#include "../cluster_config.cuh"
 #include "../collective/fmha_common.hpp"
 #include "../collective/fmha_fusion.hpp"
 #include "cute/arch/cluster_sm90.hpp"
@@ -181,6 +182,18 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
   CUTLASS_DEVICE auto apply_batch(const Params& params, ProblemShape const& problem_shape,
                                   int batch_idx) {
     return apply_variable_length(params.problem_shape, batch_idx);
+  }
+
+  // mech1 (DSM split-KV): a work item activates KV splitting when replicated
+  // scheduling is on, the mask is non-causal, and the KV range is long enough
+  // to amortize the merge. All cluster ranks evaluate this identically.
+  template <class LogicalProblemShape>
+  CUTLASS_DEVICE static bool is_mech1_active(Params const& params,
+                                             LogicalProblemShape const& problem_shape) {
+    constexpr bool kIsCausal =
+        cute::is_same_v<typename CollectiveMainloop::Mask, cutlass::fmha::collective::CausalMask>;
+    return params.mainloop.kvsplit_mode && !kIsCausal &&
+           get<1>(problem_shape) >= flashinfer::kMech1KvLenThreshold;
   }
 
   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
@@ -380,6 +393,12 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     CollectiveMainloop mainloop;
     CollectiveEpilogue epilogue{params.epilogue};
 
+    // 0 for cluster-1 launches; under kvsplit the planner replicates each
+    // cluster's work list to all ranks, so every role sees identical items.
+    uint32_t const cluster_rank =
+        (cute::size(ClusterShape{}) > 1) ? cute::block_rank_in_cluster() : 0;
+    bool const kvsplit_mode = params.mainloop.kvsplit_mode;
+
     if (role == WarpRole::Softmax0 || role == WarpRole::Softmax1) {
       warpgroup_reg_set<NumRegsSoftmax>();
 
@@ -391,6 +410,12 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
             apply_batch(params, params.problem_shape, get<2, 1>(blk_coord));
 
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
+          continue;
+        }
+
+        // Peers only join items that activate KV splitting.
+        if (kvsplit_mode && cluster_rank != 0 &&
+            !is_mech1_active(params, logical_problem_shape)) {
           continue;
         }
 
@@ -422,6 +447,11 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
+        bool mech1_active = is_mech1_active(params, logical_problem_shape);
+        if (kvsplit_mode && cluster_rank != 0 && !mech1_active) {
+          continue;
+        }
+
         if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
           mainloop.correction_empty(blk_coord, params.mainloop, logical_problem_shape,
                                     params.problem_shape, shared_storage.epilogue,
@@ -434,7 +464,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
                             pipeline_s0_corr_consumer_state, pipeline_s1_corr,
                             pipeline_s1_corr_consumer_state, pipeline_mma_corr,
                             pipeline_mma_corr_consumer_state, pipeline_corr_epi,
-                            pipeline_corr_epi_producer_state, epilogue);
+                            pipeline_corr_epi_producer_state, epilogue,
+                            /*mech1_peer=*/mech1_active && cluster_rank != 0);
       }
 
       if constexpr (NumWarpsEpilogue == 0) {
@@ -459,6 +490,11 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
             apply_batch(params, params.problem_shape, get<2, 1>(blk_coord));
 
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
+          continue;
+        }
+
+        if (kvsplit_mode && cluster_rank != 0 &&
+            !is_mech1_active(params, logical_problem_shape)) {
           continue;
         }
 
@@ -487,6 +523,14 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
             apply_batch(params, params.problem_shape, get<2, 1>(blk_coord));
 
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
+          continue;
+        }
+
+        // Keep work_idx in step with the Epilogue role so the barrier_O
+        // wait/arrive parity stays consistent across skipped items.
+        if (kvsplit_mode && cluster_rank != 0 &&
+            !is_mech1_active(params, logical_problem_shape)) {
+          work_idx++;
           continue;
         }
 
@@ -524,9 +568,16 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
+        bool mech1_active = is_mech1_active(params, logical_problem_shape);
+        if (kvsplit_mode && cluster_rank != 0 && !mech1_active) {
+          work_idx++;
+          continue;
+        }
+
         epilogue.store(blk_coord, logical_problem_shape, params.epilogue, params.problem_shape,
                        shared_storage.epilogue, pipeline_corr_epi,
-                       pipeline_corr_epi_consumer_state);
+                       pipeline_corr_epi_consumer_state,
+                       /*mech1_peer=*/mech1_active && cluster_rank != 0);
 
         work_idx++;
       }

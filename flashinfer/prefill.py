@@ -3057,6 +3057,73 @@ def fmha_varlen_plan(
     )
 
 
+# Mirror of kSm100ClusterSize in
+# include/flashinfer/attention/blackwell/cluster_config.cuh.
+_SM100_CLUSTER_SIZE = 2
+
+
+def fmha_varlen_plan_kvsplit(
+    qo_segment_offsets: torch.Tensor,
+    kv_segment_offsets: torch.Tensor,
+    num_qo_heads: int,
+    cluster_size: int = _SM100_CLUSTER_SIZE,
+):
+    """Cluster-replicated host planner for mech1 (DSM split-KV) on SM100.
+
+    Each work item is assigned to the least-loaded cluster and appended to
+    ALL cluster_size CTA work lists of that cluster, so cluster ranks walk
+    identical item sequences. This keeps the in-kernel merge barriers in
+    lockstep across ranks; the per-rank KV slicing happens on-device.
+    """
+    device = qo_segment_offsets.device
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    num_ctas = (sm_count // cluster_size) * cluster_size
+    num_clusters = num_ctas // cluster_size
+    qo_tile_size = 256
+
+    qo_off = qo_segment_offsets.cpu().tolist()
+    kv_off = kv_segment_offsets.cpu().tolist()
+    batch_size = len(qo_off) - 1
+
+    items = []  # (cost, qo_tile_idx, head_idx, batch_idx)
+    for b in range(batch_size):
+        qo_len = qo_off[b + 1] - qo_off[b]
+        kv_len = kv_off[b + 1] - kv_off[b]
+        num_tiles = (qo_len + qo_tile_size - 1) // qo_tile_size
+        for h in range(num_qo_heads):
+            for t in range(num_tiles):
+                items.append((kv_len, t, h, b))
+    # Longest-processing-time greedy over clusters.
+    items.sort(key=lambda x: -x[0])
+    loads = [0] * num_clusters
+    cluster_items = [[] for _ in range(num_clusters)]
+    for cost, t, h, b in items:
+        c = min(range(num_clusters), key=loads.__getitem__)
+        loads[c] += max(cost, 1)
+        cluster_items[c].append((t, h, b))
+
+    work_indptr = [0] * (num_ctas + 1)
+    qo_tile_indices: List[int] = []
+    head_indices: List[int] = []
+    batch_indices: List[int] = []
+    for cta in range(num_ctas):
+        for t, h, b in cluster_items[cta // cluster_size]:
+            qo_tile_indices.append(t)
+            head_indices.append(h)
+            batch_indices.append(b)
+        work_indptr[cta + 1] = len(qo_tile_indices)
+
+    def to_dev(lst):
+        return torch.tensor(lst, device=device, dtype=torch.int32)
+
+    return (
+        to_dev(work_indptr),
+        to_dev(qo_tile_indices),
+        to_dev(head_indices),
+        to_dev(batch_indices),
+    )
+
+
 @overload
 def fmha_varlen(
     q: torch.Tensor,
@@ -3104,6 +3171,7 @@ def fmha_varlen(
     causal: bool = False,
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
+    kvsplit_mode: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     workspace_buffer = _get_cache_buf(
         "fmha_varlen_cutlass_workspace", 32 * 1024 * 1024, q.device
@@ -3132,10 +3200,18 @@ def fmha_varlen(
     if max_qo_len is None:
         max_qo_len = torch.max(qo_segment_offsets[1:] - qo_segment_offsets[:-1]).item()
 
+    if kvsplit_mode and causal:
+        raise ValueError("kvsplit_mode does not support causal masking yet")
+
     if plan_info is None:
-        plan_info = fmha_varlen_plan(
-            module, qo_segment_offsets, kv_segment_offsets, num_qo_heads, causal
-        )
+        if kvsplit_mode:
+            plan_info = fmha_varlen_plan_kvsplit(
+                qo_segment_offsets, kv_segment_offsets, num_qo_heads
+            )
+        else:
+            plan_info = fmha_varlen_plan(
+                module, qo_segment_offsets, kv_segment_offsets, num_qo_heads, causal
+            )
 
     (
         work_indptr,
@@ -3178,6 +3254,7 @@ def fmha_varlen(
         head_dim_qk,
         head_dim_vo,
         max_qo_len,
+        kvsplit_mode,
     )
 
     return out, lse
