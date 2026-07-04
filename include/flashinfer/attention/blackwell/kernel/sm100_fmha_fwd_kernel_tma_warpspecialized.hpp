@@ -196,6 +196,29 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
            get<1>(problem_shape) >= flashinfer::kMech1KvLenThreshold;
   }
 
+  // mech1: tile-aligned KV slice for this cluster rank. Returns the problem
+  // shape with kv_len replaced by the rank-local slice length (possibly 0 for
+  // trailing ranks; never clamp onto the last tile, zero-length is the
+  // correct encoding) plus the slice start in KV tiles. All per-role trip
+  // counts derive from get<1>(problem_shape), so agreement is by construction.
+  template <class LogicalProblemShape>
+  CUTLASS_DEVICE static auto mech1_kv_slice(LogicalProblemShape const& problem_shape,
+                                            bool mech1_active, uint32_t cluster_rank) {
+    auto local_shape = problem_shape;
+    int kv_tile_start = 0;
+    if (mech1_active) {
+      int tile_kv = get<1>(TileShape{});
+      int cluster_size = cute::size(ClusterShape{});
+      int kv_tile_cnt = ceil_div(get<1>(problem_shape), tile_kv);
+      int tiles_per_rank = ceil_div(kv_tile_cnt, cluster_size);
+      kv_tile_start = tiles_per_rank * static_cast<int>(cluster_rank);
+      int kv_len_local = get<1>(problem_shape) - kv_tile_start * tile_kv;
+      kv_len_local = cutlass::fast_max(0, cutlass::fast_min(kv_len_local, tiles_per_rank * tile_kv));
+      get<1>(local_shape) = kv_len_local;
+    }
+    return cute::make_tuple(local_shape, kv_tile_start);
+  }
+
   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
@@ -414,8 +437,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         }
 
         // Peers only join items that activate KV splitting.
-        if (kvsplit_mode && cluster_rank != 0 &&
-            !is_mech1_active(params, logical_problem_shape)) {
+        bool mech1_active = is_mech1_active(params, logical_problem_shape);
+        if (kvsplit_mode && cluster_rank != 0 && !mech1_active) {
           continue;
         }
 
@@ -423,10 +446,16 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
+        auto [local_problem_shape, kv_tile_start] =
+            mech1_kv_slice(logical_problem_shape, mech1_active, cluster_rank);
+        if (get<1>(local_problem_shape) == 0) {  // empty KV slice on this rank
+          continue;
+        }
+
         bool is_softmax_0 = role == WarpRole::Softmax0;
 
         mainloop.softmax(
-            is_softmax_0 ? 0 : 1, blk_coord, params.mainloop, logical_problem_shape,
+            is_softmax_0 ? 0 : 1, blk_coord, params.mainloop, local_problem_shape,
             is_softmax_0 ? pipeline_mma_s0 : pipeline_mma_s1,
             is_softmax_0 ? pipeline_mma_s0_consumer_state : pipeline_mma_s1_consumer_state,
             is_softmax_0 ? pipeline_s0_corr : pipeline_s1_corr,
@@ -459,13 +488,26 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        mainloop.correction(blk_coord, params.mainloop, params.problem_shape, logical_problem_shape,
+        auto [local_problem_shape, kv_tile_start] =
+            mech1_kv_slice(logical_problem_shape, mech1_active, cluster_rank);
+        bool mech1_peer = mech1_active && cluster_rank != 0;
+
+        if (get<1>(local_problem_shape) == 0) {  // empty KV slice on this rank
+          // Still produce (zeroed) smem_o and commit corr_epi so the
+          // Epilogue role's waits stay paired; gmem LSE writes are gated.
+          mainloop.correction_empty(blk_coord, params.mainloop, local_problem_shape,
+                                    params.problem_shape, shared_storage.epilogue,
+                                    pipeline_corr_epi, pipeline_corr_epi_producer_state, epilogue,
+                                    mech1_peer);
+          continue;
+        }
+
+        mainloop.correction(blk_coord, params.mainloop, params.problem_shape, local_problem_shape,
                             shared_storage.epilogue, pipeline_s0_corr,
                             pipeline_s0_corr_consumer_state, pipeline_s1_corr,
                             pipeline_s1_corr_consumer_state, pipeline_mma_corr,
                             pipeline_mma_corr_consumer_state, pipeline_corr_epi,
-                            pipeline_corr_epi_producer_state, epilogue,
-                            /*mech1_peer=*/mech1_active && cluster_rank != 0);
+                            pipeline_corr_epi_producer_state, epilogue, mech1_peer);
       }
 
       if constexpr (NumWarpsEpilogue == 0) {
@@ -493,8 +535,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (kvsplit_mode && cluster_rank != 0 &&
-            !is_mech1_active(params, logical_problem_shape)) {
+        bool mech1_active = is_mech1_active(params, logical_problem_shape);
+        if (kvsplit_mode && cluster_rank != 0 && !mech1_active) {
           continue;
         }
 
@@ -502,8 +544,14 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
+        auto [local_problem_shape, kv_tile_start] =
+            mech1_kv_slice(logical_problem_shape, mech1_active, cluster_rank);
+        if (get<1>(local_problem_shape) == 0) {  // empty KV slice on this rank
+          continue;
+        }
+
         mainloop.mma(
-            blk_coord, params.mainloop, logical_problem_shape, shared_storage.mainloop,
+            blk_coord, params.mainloop, local_problem_shape, shared_storage.mainloop,
             pipeline_load_q, pipeline_load_q_consumer_state, pipeline_load_k,
             pipeline_load_k_consumer_state, pipeline_load_v, pipeline_load_v_consumer_state,
             pipeline_mma_s0, pipeline_mma_s0_producer_state, pipeline_mma_s1,
@@ -528,8 +576,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
         // Keep work_idx in step with the Epilogue role so the barrier_O
         // wait/arrive parity stays consistent across skipped items.
-        if (kvsplit_mode && cluster_rank != 0 &&
-            !is_mech1_active(params, logical_problem_shape)) {
+        bool mech1_active = is_mech1_active(params, logical_problem_shape);
+        if (kvsplit_mode && cluster_rank != 0 && !mech1_active) {
           work_idx++;
           continue;
         }
@@ -539,10 +587,17 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        mainloop.load(blk_coord, logical_problem_shape, params.mainloop, params.problem_shape,
+        auto [local_problem_shape, kv_tile_start] =
+            mech1_kv_slice(logical_problem_shape, mech1_active, cluster_rank);
+        if (get<1>(local_problem_shape) == 0) {  // empty KV slice on this rank
+          work_idx++;
+          continue;
+        }
+
+        mainloop.load(blk_coord, local_problem_shape, params.mainloop, params.problem_shape,
                       shared_storage.mainloop, pipeline_load_q, pipeline_load_q_producer_state,
                       pipeline_load_k, pipeline_load_k_producer_state, pipeline_load_v,
-                      pipeline_load_v_producer_state);
+                      pipeline_load_v_producer_state, kv_tile_start);
 
         work_idx++;
       }

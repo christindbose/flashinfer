@@ -226,11 +226,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                            PipelineK& pipeline_k,
                            typename PipelineK::PipelineState& pipeline_k_producer_state,
                            PipelineV& pipeline_v,
-                           typename PipelineV::PipelineState& pipeline_v_producer_state) {
+                           typename PipelineV::PipelineState& pipeline_v_producer_state,
+                           int kv_tile_start = 0) {
     Load load;
     load.load(blk_coord, problem_shape, params.load, params_problem_shape, storage, pipeline_q,
               pipeline_q_producer_state, pipeline_k, pipeline_k_producer_state, pipeline_v,
-              pipeline_v_producer_state);
+              pipeline_v_producer_state, kv_tile_start);
   }
 
   template <class BlkCoord, class ProblemShape>
@@ -1101,7 +1102,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       BlkCoord const& blk_coord, Params const& params, ProblemShape const& problem_shape,
       ParamsProblemShape const& params_problem_shape, TensorStorageEpi& shared_storage_epi,
       PipelineE& pipeline_epi, typename PipelineE::PipelineState& pipeline_epi_producer_state,
-      CollectiveEpilogue& epilogue) {
+      CollectiveEpilogue& epilogue, bool mech1_peer = false) {
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
 
     Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()),
@@ -1123,7 +1124,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     copy(tiled_copy, tOrO, tOgO(_, _, _, _0{}));
 
-    if (epilogue.params.ptr_LSE != nullptr) {
+    // mech1 peers with an empty KV slice must not clobber the gmem LSE.
+    if (epilogue.params.ptr_LSE != nullptr && !mech1_peer) {
       int qo_tile_idx = get<0>(blk_coord);
       int qo_head_idx = get<2, 0>(blk_coord);
       int batch_idx = get<2, 1>(blk_coord);
@@ -1143,7 +1145,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     cutlass::arch::fence_view_async_shared();
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
 
-    if (epilogue.params.ptr_LSE != nullptr) {
+    if (epilogue.params.ptr_LSE != nullptr && !mech1_peer) {
       int qo_tile_idx = get<0>(blk_coord);
       int qo_head_idx = get<2, 0>(blk_coord);
       int batch_idx = get<2, 1>(blk_coord);

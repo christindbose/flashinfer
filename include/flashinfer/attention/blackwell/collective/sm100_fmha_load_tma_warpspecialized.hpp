@@ -139,14 +139,19 @@ struct Sm100FmhaLoadTmaWarpspecialized {
                            PipelineK& pipeline_k,
                            typename PipelineK::PipelineState& pipeline_k_producer_state,
                            PipelineV& pipeline_v,
-                           typename PipelineV::PipelineState& pipeline_v_producer_state) {
+                           typename PipelineV::PipelineState& pipeline_v_producer_state,
+                           int kv_tile_start = 0) {
     int qo_tile_idx = get<0>(blk_coord);
     int qo_head_idx = get<2, 0>(blk_coord);
     int batch_idx = get<2, 1>(blk_coord);
     int qo_len = get<0>(problem_shape);
+    // mech1: problem_shape carries the rank-local KV slice length; shifting
+    // the segment offset by kv_tile_start tiles makes gK/gV view the slice,
+    // so the ascending k_index/v_index loops need no other change.
     int kv_len = get<1>(problem_shape);
     int qo_segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
-    int kv_segment_offset = get<1>(params_problem_shape).segment_offsets[batch_idx];
+    int kv_segment_offset = get<1>(params_problem_shape).segment_offsets[batch_idx] +
+                            kv_tile_start * get<1>(TileShapeQK{});
 
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
 
