@@ -1194,9 +1194,12 @@ inline cudaError_t PrefillSM90Plan(
   printf("\n--- Tile Assignment ---\n");
 #endif
 
-  // When mech1 (effective_kv_len >= 4096), assign the same Q tile to 4 CTAs so each CTA
-  // works on a subset of KV; the kernel handles kv_start/num_kv_tiles internally.
-  constexpr int kMech1NumReplicas = 4; //4;
+  // When mech1 (effective_kv_len >= 4096), assign the same Q tile to kClusterSize CTAs
+  // so each CTA works on a subset of KV; the kernel handles kv_start/num_kv_tiles
+  // internally. Must equal the launch cluster size: the kernel slices by cluster rank
+  // and the DSM merge barrier waits on all cluster ranks, so fewer replicas than
+  // ranks desynchronizes the merge (observed as a hang at kClusterSize=8).
+  constexpr int kMech1NumReplicas = kClusterSize;
   // kClusterSize comes from hopper/cluster_config.cuh (single source of truth,
   // shared with the launch-time clusterDim.x in prefill_sm90.cuh).
   // Track which CTAs received real vs dummy work items

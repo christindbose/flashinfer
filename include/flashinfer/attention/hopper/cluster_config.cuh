@@ -16,7 +16,7 @@ namespace flashinfer {
 // Single source of truth: must match the value used both in the host-side
 // scheduler (PrefillSM90Plan in attention/scheduler.cuh) and in the launch
 // site that sets cudaLaunchAttributeClusterDimension (attention/hopper/prefill_sm90.cuh).
-constexpr int kClusterSize = 8;
+constexpr int kClusterSize = 4;
 
 }  // namespace flashinfer
 
