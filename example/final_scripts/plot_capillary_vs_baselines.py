@@ -28,6 +28,7 @@ APRIL_CSV = Path(
 )
 # Each capillary variant reads its own sweep CSV (geo_mean_ms per config).
 OURS_CSVS = {
+    "kvsplit c2": SCRIPT_DIR / "bench_mech2_gqa_sweep_kvsplit_cluster2.csv",
     "kvsplit c4": SCRIPT_DIR / "bench_mech2_gqa_sweep_kvsplit_cluster4.csv",
     "pack_gqa": SCRIPT_DIR / "bench_pack_on.csv",
     "kvsplit c2 + pack": SCRIPT_DIR / "bench_pack_kvsplit_cluster2.csv",
@@ -44,6 +45,7 @@ BASELINES = [
     ("Cascade", "#1baf7a"),
 ]
 OURS = [
+    ("kvsplit c2", "#eb6834"),
     ("kvsplit c4", "#eda100"),
     ("pack_gqa", "#008300"),
     ("kvsplit c2 + pack", "#e87ba4"),
