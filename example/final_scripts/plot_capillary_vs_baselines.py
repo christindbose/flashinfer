@@ -36,8 +36,9 @@ OURS_CSVS = {
 
 PANELS = [(32, 32), (32, 8), (16, 8)]
 
-# (label, color); PAT itself is the 1.0 reference line.
+# (label, color); PAT bars are exactly 1.0 by construction.
 BASELINES = [
+    ("PAT", "#444444"),
     ("FastTree", "#2a78d6"),
     ("FlashAttention3", "#e34948"),
     ("Cascade", "#1baf7a"),
@@ -48,7 +49,8 @@ OURS = [
     ("kvsplit c2 + pack", "#e87ba4"),
     ("kvsplit c4 + pack", "#4a3aa7"),
 ]
-APRIL_COL = {"FastTree": "FastTree_ms", "FlashAttention3": "fa_ms", "Cascade": "cascade_ms"}
+APRIL_COL = {"PAT": "pat_ms", "FastTree": "FastTree_ms", "FlashAttention3": "fa_ms",
+             "Cascade": "cascade_ms"}
 
 
 def load_april():
@@ -105,8 +107,6 @@ def make_plot(april, ours, trees, include_fa, suffix):
             ax.bar(x + (i - (n_series - 1) / 2) * width, vals, width * 0.92,
                    color=color, zorder=3, label=label if ax is axes[0] else None)
         ax.axhline(1.0, color="#555555", linewidth=1.0, linestyle=(0, (4, 3)), zorder=4)
-        ax.annotate("PAT", (len(trees) - 0.2, 1.0), xytext=(4, 2),
-                    textcoords="offset points", fontsize=8, color="#555555")
         ax.set_ylim(0, y_max)
         ax.grid(axis="y", color="#dddddd", linewidth=0.6, zorder=0)
         for spine in ("top", "right"):
