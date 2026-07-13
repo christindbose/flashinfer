@@ -137,9 +137,13 @@ struct CollectiveMainloop {
     cute::prefetch_tma_descriptor(mainloop_params.tma_load_V.get_tma_descriptor());
   }
 
-  CUTLASS_DEVICE
-  int get_num_kv_tiles(Params const& mainloop_params, int q_tile_idx, const int qo_len,
-                       const int kv_len) {
+  // PACK_GQA_ accepted for signature parity with SparseCollectiveMainloop;
+  // the dense (ragged) path never packs, so it must stay false.
+  template <bool PACK_GQA_ = false>
+  CUTLASS_DEVICE int get_num_kv_tiles(Params const& mainloop_params, int q_tile_idx,
+                                      const int qo_len, const int kv_len,
+                                      const int group_size = 1) {
+    static_assert(!PACK_GQA_, "pack_gqa is not supported on the dense (ragged) mainloop");
     static constexpr int CTA_Q = get<0>(TileShape_QKD{});
     static constexpr int CTA_KV = get<1>(TileShape_QKD{});
     int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);

@@ -993,6 +993,8 @@ inline cudaError_t PrefillSM90Plan(
     FLASHINFER_ERROR(err_msg.str());
   }
   uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
+  // Under pack_gqa each work item covers qo_len * h_r packed rows.
+  const int pack_h_r = pack_gqa ? int(gqa_group_size) : 1;
   if (pack_gqa && gqa_group_size > 16) {
     std::ostringstream err_msg;
     err_msg << "pack_gqa supports GQA group sizes up to 16, got " << gqa_group_size;
@@ -1154,11 +1156,11 @@ inline cudaError_t PrefillSM90Plan(
   std::vector<std::tuple<int, int, int, int, int, int, float>> all_tiles_with_cost;
   // tuple: (batch_idx, qo_tile_idx, qo_len, kv_len, qo_indptr, kv_indptr, cost)
   for (const auto& [idx, qo_len, kv_len] : idx_qo_kv_len_vec) {
-    int num_qo_tiles = ceil_div(qo_len, 128);  // Using cta_tile_q = 128 temporarily
+    int num_qo_tiles = ceil_div(qo_len * pack_h_r, 128);  // Using cta_tile_q = 128 temporarily
     for (int qo_tile_idx = 0; qo_tile_idx < num_qo_tiles; ++qo_tile_idx) {
       // For non-causal or when causal, calculate effective kv_len
       int effective_kv_len = causal 
-        ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, 128, num_qo_tiles, 1)
+        ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, 128, num_qo_tiles, pack_h_r)
         : kv_len;
       float tile_cost = cost_function(128, effective_kv_len);
       all_tiles_with_cost.push_back({idx, qo_tile_idx, qo_len, kv_len, 
@@ -1208,7 +1210,7 @@ inline cudaError_t PrefillSM90Plan(
       cta_head_indices(num_total_ctas, std::vector<IdType>()),
       cta_batch_indices(num_total_ctas, std::vector<IdType>());
 
-  int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
+  int max_num_works_per_head = ceil_div(total_num_rows * pack_h_r, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = true;
   plan_info.kvsplit_mode = kvsplit_mode;
   plan_info.mech2_mode = mech2_mode;
@@ -1290,11 +1292,11 @@ inline cudaError_t PrefillSM90Plan(
           auto& [i, qo_len, kv_len] = idx_qo_kv_len_vec[entry_idx];
           bool is_dummy = idx_is_dummy[entry_idx];
           int cta_idx = base_cta + static_cast<int>(g % kClusterSize);
-          int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
+          int num_qo_tiles = ceil_div(qo_len * pack_h_r, cta_tile_q);
 
           for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
             int effective_kv_len =
-                causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
+                causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, pack_h_r)
                        : kv_len;
             float tile_cost = is_dummy ? 0.0f : cost_function(cta_tile_q, effective_kv_len);
 
@@ -1335,10 +1337,10 @@ inline cudaError_t PrefillSM90Plan(
         // Normal min-heap assignment (mech1 or unconstrained)
         auto& [i, qo_len, kv_len] = idx_qo_kv_len_vec[vec_idx];
         bool is_dummy = idx_is_dummy[vec_idx];
-        int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
+        int num_qo_tiles = ceil_div(qo_len * pack_h_r, cta_tile_q);
         for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
           int effective_kv_len =
-              causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
+              causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, pack_h_r)
                      : kv_len;
           bool is_mech1 = kvsplit_mode && (effective_kv_len >= 4096);
           int num_replicas = is_mech1 ? kMech1NumReplicas : 1;

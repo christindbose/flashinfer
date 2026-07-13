@@ -229,6 +229,10 @@ struct BatchPrefillTileScheduler {
     uint8_t* cta_valid_work;
     uint8_t* cta_is_dummy;
     int num_ctas_launched;  // cluster-aligned CTA count from scheduler
+    // pack_gqa: KV-head-major grid (grid.y = num_kv_heads); blockIdx.y is the
+    // KV head and the h_r QO heads of its group are packed into Q-tile rows.
+    bool pack_gqa = false;
+    int num_kv_heads = 0;
   };
 
   // Device side kernel params
@@ -242,18 +246,20 @@ struct BatchPrefillTileScheduler {
     uint8_t* cta_mech_mode;
     uint8_t* cta_valid_work;
     uint8_t* cta_is_dummy;
+    bool pack_gqa;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
     return {args.work_indptr, args.qo_tile_indices, args.qo_indptr,     args.kv_indptr,
             args.qo_lens,     args.kv_lens,         args.batch_indices, args.group_size_fastdiv,
             args.num_qo_heads, args.kvsplit_mode, args.mech2_mode, args.cta_mech_mode, args.cta_valid_work,
-            args.cta_is_dummy};
+            args.cta_is_dummy, args.pack_gqa};
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) {
     int grid_x = (args.num_ctas_launched > 0) ? args.num_ctas_launched : num_sm;
-    return {(unsigned)grid_x, (unsigned)args.num_qo_heads};
+    int grid_y = args.pack_gqa ? args.num_kv_heads : args.num_qo_heads;
+    return {(unsigned)grid_x, (unsigned)grid_y};
   }
 
   struct WorkTileInfo {
@@ -288,8 +294,15 @@ struct BatchPrefillTileScheduler {
     int ptr_end = params.work_indptr[blockIdx.x + 1];
     if (ptr_begin < ptr_end) {
       int work_idx = ptr_begin;
-      int qo_head_idx = blockIdx.y;
-      int kv_head_idx = params.group_size_fastdiv.divide(qo_head_idx);
+      int qo_head_idx, kv_head_idx;
+      if (params.pack_gqa) {
+        // blockIdx.y IS the KV head; qo_head_idx is the GROUP BASE head.
+        kv_head_idx = blockIdx.y;
+        qo_head_idx = kv_head_idx * params.group_size_fastdiv.divisor;
+      } else {
+        qo_head_idx = blockIdx.y;
+        kv_head_idx = params.group_size_fastdiv.divide(qo_head_idx);
+      }
       return {params.qo_tile_indices[work_idx],
               /*qo_head_idx=*/qo_head_idx,
               /*kv_head_idx=*/kv_head_idx,

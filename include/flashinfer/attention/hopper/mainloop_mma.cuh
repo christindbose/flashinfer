@@ -13,15 +13,17 @@
 #include <cutlass/numeric_types.h>
 #include <cooperative_groups.h>
 
+#include "pack_gqa.cuh"
+
 namespace flashinfer {
 
 
 
 
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
-          typename WarpScheduler, typename AttentionVariant, typename Params,
-          typename MainloopPipeline, typename PipelineState, typename SharedStorage,
-          typename FrgTensorO, typename AttentionUpdater>
+          typename WarpScheduler, bool PACK_GQA = false, typename AttentionVariant,
+          typename Params, typename MainloopPipeline, typename PipelineState,
+          typename SharedStorage, typename FrgTensorO, typename AttentionUpdater>
 CUTLASS_DEVICE void mma_f16(
     const Params& mainloop_params, AttentionVariant& variant, MainloopPipeline pipeline_k,
     MainloopPipeline pipeline_v, PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
@@ -30,7 +32,10 @@ CUTLASS_DEVICE void mma_f16(
     int q_tile_idx, SharedStorage& shared_storage, const int32_t qo_len, const int32_t kv_len,
     const int32_t qo_head_idx, const int32_t kv_head_idx, const uint32_t prefix_len,
     uint16_t* token_pos_in_items, const int num_kv_tiles_outside_items_window = 0,
-    const int num_kv_tiles_prefix = 0, const int clusterBlockRank = 0, const int cluster_size = 1, const bool kvsplit_mode = false) {
+    const int num_kv_tiles_prefix = 0, const int clusterBlockRank = 0, const int cluster_size = 1, const bool kvsplit_mode = false,
+    cutlass::FastDivmod group_size_fastdiv = cutlass::FastDivmod(1)) {
+  static_assert(!(PACK_GQA && (MULTIITEMSCORING || LEFT_SLIDING_WINDOW)),
+                "pack_gqa x multi-item / sliding-window unsupported");
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using IdType = typename Ktraits::IdType;
@@ -188,8 +193,18 @@ CUTLASS_DEVICE void mma_f16(
     for (int i = 0; i < size(tSrS); ++i) {
       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
       int kv_idx = get<1>(tScS(i)) + kv_tile_idx * CTA_KV;
+      int logits_qo_head_idx = qo_head_idx;
+      if constexpr (PACK_GQA) {
+        // qo_idx is a packed (token, head-in-group) row; masks work on the
+        // token, per-head logic on the decoded head. Rows past
+        // qo_len * group_size hold stale smem, but softmax is row-local and
+        // those rows are never stored (FA3 makes the same argument).
+        auto coord = unpack_qo_row(qo_idx, group_size_fastdiv);
+        logits_qo_head_idx = qo_head_idx + coord.head_offset;
+        qo_idx = coord.token;
+      }
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                        qo_head_idx, kv_head_idx);
+                                        logits_qo_head_idx, kv_head_idx);
       if constexpr (MULTIITEMSCORING) {
         mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
       } else if constexpr (!CAUSAL) {  // Just masking based on col
@@ -249,8 +264,22 @@ CUTLASS_DEVICE void mma_f16(
     for (int i = 0; i < size(tSrS); ++i) {
       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
       int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
+      int logits_qo_head_idx = qo_head_idx;
+      if constexpr (PACK_GQA) {
+        auto coord = unpack_qo_row(qo_idx, group_size_fastdiv);
+        logits_qo_head_idx = qo_head_idx + coord.head_offset;
+        qo_idx = coord.token;
+      }
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                        qo_head_idx, kv_head_idx);
+                                        logits_qo_head_idx, kv_head_idx);
+      if constexpr (CAUSAL && !MULTIITEMSCORING) {
+        // The diagonal can span more than one KV tile (CTA_KV < CTA_Q, or
+        // unaligned kv_len - qo_len offsets), so masking only the first
+        // processed tile is not enough; mask every tile that intersects it.
+        if (kv_idx >= std::min(kv_len, col_limit_right(qo_idx))) {
+          tSrS(i) = AttentionUpdater::fill_value;
+        }
+      }
     }
 
     attention_updater.update</*init=*/false>(tSrS);

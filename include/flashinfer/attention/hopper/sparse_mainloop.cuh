@@ -27,13 +27,15 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "named_barrier.cuh"
+#include "pack_gqa.cuh"
 #include "utils.cuh"
 
 namespace flashinfer {
 
 using namespace cute;
 
-template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIITEMSCORING = false>
+template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIITEMSCORING = false,
+          bool PACK_GQA = false>
 struct SparseCollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
@@ -116,6 +118,7 @@ struct SparseCollectiveMainloop {
     LayoutT layout_K;
     LayoutT layout_V;
     TMA_Q tma_load_Q;
+    DTypeQ* Q_ptr;  // raw pointer for the PACK_GQA cp.async Q load
     DTypeKV* K_ptr;
     DTypeKV* V_ptr;
     IdType* kv_indices;
@@ -131,6 +134,7 @@ struct SparseCollectiveMainloop {
             args.layout_K,
             args.layout_V,
             tma_load_Q,
+            const_cast<DTypeQ*>(args.Q_ptr),
             const_cast<DTypeKV*>(args.K_ptr),
             const_cast<DTypeKV*>(args.V_ptr),
             const_cast<IdType*>(args.kv_indices),
@@ -143,15 +147,20 @@ struct SparseCollectiveMainloop {
     cute::prefetch_tma_descriptor(mainloop_params.tma_load_Q.get_tma_descriptor());
   }
 
-  CUTLASS_DEVICE
-  int get_num_kv_tiles(Params const& mainloop_params, int q_tile_idx, const int qo_len,
-                       const int kv_len) {
+  template <bool PACK_GQA_ = false>
+  CUTLASS_DEVICE int get_num_kv_tiles(Params const& mainloop_params, int q_tile_idx,
+                                      const int qo_len, const int kv_len,
+                                      const int group_size = 1) {
     static constexpr int CTA_Q = get<0>(TileShape_QKD{});
     static constexpr int CTA_KV = get<1>(TileShape_QKD{});
     int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);
     if constexpr (CAUSAL) {
-      num_kv_tiles = std::min(num_kv_tiles,
-                              cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
+      // Under PACK_GQA a Q-tile row is a packed (token, head) index; the
+      // causal bound depends on the LAST TOKEN covered by the tile.
+      int last_row_token_p1 = PACK_GQA_ ? ((q_tile_idx + 1) * CTA_Q - 1) / group_size + 1
+                                        : (q_tile_idx + 1) * CTA_Q;
+      num_kv_tiles =
+          std::min(num_kv_tiles, cute::ceil_div(last_row_token_p1 + kv_len - qo_len, CTA_KV));
     }
     if constexpr (MULTIITEMSCORING) {
       num_kv_tiles = std::min(num_kv_tiles,
@@ -195,7 +204,8 @@ struct SparseCollectiveMainloop {
         tma_partition(mainloop_params.tma_load_Q, _0{}, Layout<_1>{}, group_modes<0, 2>(sQ_x),
                       group_modes<0, 2>(gQ_x));  // (TMA), (TMA)
 
-    int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
+    int num_kv_tiles = get_num_kv_tiles<PACK_GQA>(mainloop_params, q_tile_idx, qo_len, kv_len,
+                                                  scheduler_params.group_size_fastdiv.divisor);
     
     int kv_tile_idx = num_kv_tiles - 1;
     
@@ -301,14 +311,42 @@ struct SparseCollectiveMainloop {
       cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
                                         static_cast<int>(NamedBarriers::kQueryEmpty));
 
-      int lane_predicate = cute::elect_one_sync();
-      if (lane_predicate) {
-        shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
-        copy(mainloop_params.tma_load_Q.with(
-                 reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
-                     shared_storage.barrier_Q),
-                 /*mcast_mask=*/0),
-             tQgQ, tQsQ);
+      if constexpr (PACK_GQA) {
+        // Packed Q view ((group_size, qo_len), D) based at the group's first
+        // QO head; loaded with cp.async by all 32 threads of warp 0. TMA
+        // cannot express the packed view for arbitrary group sizes.
+        // barrier_Q commit: each thread's cp.async increments the expected
+        // count at issue and arrives at completion (self-balancing), the
+        // explicit arrive() matches the init count of 32.
+        auto const& gs_fastdiv = scheduler_params.group_size_fastdiv;
+        int const group_size = gs_fastdiv.divisor;
+        DTypeQ const* q_base = mainloop_params.Q_ptr +
+                               int64_t(qo_indptr) * stride<0>(mainloop_params.layout_Q) +
+                               int64_t(qo_head_idx) * stride<2>(mainloop_params.layout_Q);
+        Tensor mQ_packed = make_tensor(
+            make_gmem_ptr(q_base),
+            make_shape(make_shape(group_size, qo_len), Int<HEAD_DIM_QK>{}),
+            make_stride(make_stride(stride<2>(mainloop_params.layout_Q),
+                                    stride<0>(mainloop_params.layout_Q)),
+                        _1{}));
+        Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+        using PackGQAt =
+            PackGQAManager<CTA_Q, HEAD_DIM_QK, cutlass::NumThreadsPerWarp, DTypeQ>;
+        PackGQAt::load_Q(mQ_packed, sQ_pi, gs_fastdiv, thread_idx % cutlass::NumThreadsPerWarp,
+                         qo_len, q_tile_idx);
+        cutlass::arch::cpasync_barrier_arrive(
+            reinterpret_cast<uint64_t*>(&shared_storage.barrier_Q));
+        shared_storage.barrier_Q.arrive();
+      } else {
+        int lane_predicate = cute::elect_one_sync();
+        if (lane_predicate) {
+          shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
+          copy(mainloop_params.tma_load_Q.with(
+                   reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
+                       shared_storage.barrier_Q),
+                   /*mcast_mask=*/0),
+               tQgQ, tQsQ);
+        }
       }
     }
 

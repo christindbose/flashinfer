@@ -15,6 +15,7 @@
 #include "cute/arch/copy_sm75.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "named_barrier.cuh"
+#include "pack_gqa.cuh"
 #include "utils.cuh"
 
 #include <cooperative_groups.h>
@@ -79,6 +80,49 @@ __forceinline__ __device__ void write_O(ElemO* O, const TiledCopyO& tiled_copy_O
                                 qo_tile_idx, qo_head_idx, qo_indptr, qo_len);
 }
 
+// PACK_GQA smem -> gmem O store: smem row r is a packed (token, head-in-group)
+// index; each row scatters to gmem row (qo_indptr + token) of head
+// (qo_head_base + head_offset). Per-row FastDivmod (mul+shift); the FA3
+// shfl-shared pointer optimization is a recorded follow-up.
+template <int NUM_COPY_THREADS, typename DTypeO, typename TiledCopyO, typename LayoutO,
+          typename TileShapeO, typename SMemO>
+__forceinline__ __device__ void write_tiled_packed(
+    DTypeO* O, const TiledCopyO& tiled_copy_O, const LayoutO& layout_O,
+    const TileShapeO& tile_shape_O, const SMemO& sO, int thread_idx, int qo_tile_idx,
+    int qo_head_base, int qo_indptr, int qo_len,
+    cutlass::FastDivmod const& group_size_fastdiv) {
+  Tensor cO = cute::make_identity_tensor(
+      make_shape(get<0>(tile_shape_O), get<1>(tile_shape_O)));  // (O, D)
+  ThrCopy thr_copy_O = tiled_copy_O.get_slice(thread_idx);
+  Tensor tOsO = thr_copy_O.partition_S(sO);  // (CPY, CPY_O, CPY_D)
+  Tensor tOcO = thr_copy_O.partition_D(cO);  // (CPY, CPY_O, CPY_D)
+
+  const int qo_tile_size = get<0>(tile_shape_O);
+  const int packed_len = qo_len * group_size_fastdiv.divisor;
+  const int64_t stride_n = stride<0>(layout_O);
+  const int64_t stride_h = stride<2>(layout_O);
+
+#pragma unroll
+  for (int m = 0; m < size<1>(tOsO); ++m) {
+    int row = get<0>(tOcO(_0{}, m, _0{}));
+    int packed_idx = qo_tile_idx * qo_tile_size + row;
+    if (packed_idx < packed_len) {
+      int head_offset, token;
+      token = group_size_fastdiv.divmod(head_offset, packed_idx);
+      DTypeO* row_ptr = O + (int64_t(qo_indptr) + token) * stride_n +
+                        int64_t(qo_head_base + head_offset) * stride_h;
+#pragma unroll
+      for (int k = 0; k < size<2>(tOsO); ++k) {
+        int col = get<1>(tOcO(_0{}, _0{}, k));
+        // Keep the nested mode-0 profile of the smem slice so ranks match.
+        Tensor gO_vec = make_tensor(make_gmem_ptr(row_ptr + col),
+                                    make_layout(make_shape(shape<0>(tOsO))));
+        cute::copy(tiled_copy_O, tOsO(_, m, k), gO_vec);
+      }
+    }
+  }
+}
+
 template <int NUM_COPY_THREADS, typename DTypeO, typename TiledCopyO, typename LayoutO,
           typename TileShapeO, typename RegTensorO>
 __forceinline__ __device__ void write_tiled_new(DTypeO* O, const TiledCopyO& tiled_copy_O,
@@ -138,7 +182,7 @@ __forceinline__ __device__ void write_O_new(ElemO* O, const TiledCopyO& tiled_co
                                 qo_tile_idx, qo_head_idx, qo_indptr, qo_len);
 }
 
-template <typename Ktraits>
+template <typename Ktraits, bool PACK_GQA = false>
 struct CollectiveEpilogue {
   using DTypeO = typename Ktraits::DTypeO;
   static constexpr int CTA_Q = Ktraits::CTA_Q;
@@ -227,7 +271,8 @@ struct CollectiveEpilogue {
             typename TiledMma>
   CUTLASS_DEVICE void store(Params const& epilogue_params, FrgTensorO const& tOrO,
                             FrgTensorLSE const& lse, SharedStorage& shared_storage,
-                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord) {
+                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord,
+                            cutlass::FastDivmod group_size_fastdiv = cutlass::FastDivmod(1)) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
@@ -262,8 +307,17 @@ struct CollectiveEpilogue {
 #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
           const int row = get<0>(tOcO_row(mi));
-          if (row < qo_len - qo_tile_idx * CTA_Q) {
-            gLSE(row) = lse(mi);
+          if constexpr (PACK_GQA) {
+            int packed_idx = qo_tile_idx * CTA_Q + row;
+            if (packed_idx < qo_len * group_size_fastdiv.divisor) {
+              auto coord = unpack_qo_row(packed_idx, group_size_fastdiv);
+              // mLSE is (head, pos); qo_head_idx is the group base head
+              mLSE(qo_head_idx + coord.head_offset, qo_indptr + coord.token) = lse(mi);
+            }
+          } else {
+            if (row < qo_len - qo_tile_idx * CTA_Q) {
+              gLSE(row) = lse(mi);
+            }
           }
         }
       }
@@ -275,9 +329,16 @@ struct CollectiveEpilogue {
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     }
     TiledCopyO gmem_tiled_copy_O;
-    write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
-                              select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
-                              qo_head_idx, qo_indptr, qo_len, write_warp_idx);
+    if constexpr (PACK_GQA) {
+      write_tiled_packed<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O,
+                                           epilogue_params.layout_O, select<0, 1>(TileShape_PDV{}),
+                                           sO, thread_idx, qo_tile_idx, qo_head_idx, qo_indptr,
+                                           qo_len, group_size_fastdiv);
+    } else {
+      write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
+                                select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
+                                qo_head_idx, qo_indptr, qo_len, write_warp_idx);
+    }
   }
 
   
@@ -440,7 +501,8 @@ struct CollectiveEpilogue {
                             FrgTensorLSE const& lse, SharedStorage& shared_storage,
                             TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord,
                             const int clusterBlockRank = 0, const int cluster_size = 1,
-                            const bool kvsplit_mode_or_mech2_mode = false) {
+                            const bool kvsplit_mode_or_mech2_mode = false,
+                            cutlass::FastDivmod group_size_fastdiv = cutlass::FastDivmod(1)) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
@@ -494,7 +556,9 @@ struct CollectiveEpilogue {
     }
 
     static constexpr int kReductionSync = 7;
-    int valid_qo_tile_size = min(qo_len - qo_tile_idx * CTA_Q, CTA_Q);
+    // Under PACK_GQA smem rows are packed (token, head) indices.
+    const int row_space = PACK_GQA ? qo_len * group_size_fastdiv.divisor : qo_len;
+    int valid_qo_tile_size = min(row_space - qo_tile_idx * CTA_Q, CTA_Q);
 
     if (clusterBlockRank == 0) {
       if ((cluster_size > 1) && (kvsplit_mode_or_mech2_mode)) {
@@ -556,7 +620,12 @@ struct CollectiveEpilogue {
           Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx,
                                                   qo_indptr, qo_len)(_, qo_tile_idx);
           for (int row = thread_idx; row < valid_qo_tile_size; row += NUM_MMA_THREADS) {
-            gLSE(row) = smem_lse_ptr[row];
+            if constexpr (PACK_GQA) {
+              auto coord = unpack_qo_row(qo_tile_idx * CTA_Q + row, group_size_fastdiv);
+              mLSE(qo_head_idx + coord.head_offset, qo_indptr + coord.token) = smem_lse_ptr[row];
+            } else {
+              gLSE(row) = smem_lse_ptr[row];
+            }
           }
         }
 
@@ -570,10 +639,17 @@ struct CollectiveEpilogue {
                                             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         }
         TiledCopyO gmem_tiled_copy_O;
-        write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O,
-                                  epilogue_params.layout_O, select<0, 1>(TileShape_PDV{}), sO,
-                                  thread_idx, qo_tile_idx, qo_head_idx, qo_indptr, qo_len,
-                                  write_warp_idx);
+        if constexpr (PACK_GQA) {
+          write_tiled_packed<NUM_COPY_THREADS>(
+              epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
+              select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx, qo_head_idx, qo_indptr,
+              qo_len, group_size_fastdiv);
+        } else {
+          write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O,
+                                    epilogue_params.layout_O, select<0, 1>(TileShape_PDV{}), sO,
+                                    thread_idx, qo_tile_idx, qo_head_idx, qo_indptr, qo_len,
+                                    write_warp_idx);
+        }
       } else {
         // No cross-CTA reduction (cluster_size == 1 or not kvsplit mode)
         // Write LSE to gmem
@@ -587,7 +663,12 @@ struct CollectiveEpilogue {
             for (int mi = 0; mi < kLseSize; ++mi) {
               const int row = get<0>(tOcO_row(mi));
               if (row < valid_qo_tile_size) {
-                gLSE(row) = lse_data[mi];
+                if constexpr (PACK_GQA) {
+                  auto coord = unpack_qo_row(qo_tile_idx * CTA_Q + row, group_size_fastdiv);
+                  mLSE(qo_head_idx + coord.head_offset, qo_indptr + coord.token) = lse_data[mi];
+                } else {
+                  gLSE(row) = lse_data[mi];
+                }
               }
             }
           }
@@ -600,10 +681,17 @@ struct CollectiveEpilogue {
                                             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         }
         TiledCopyO gmem_tiled_copy_O;
-        write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O,
-                                  epilogue_params.layout_O, select<0, 1>(TileShape_PDV{}), sO,
-                                  thread_idx, qo_tile_idx, qo_head_idx, qo_indptr, qo_len,
-                                  write_warp_idx);
+        if constexpr (PACK_GQA) {
+          write_tiled_packed<NUM_COPY_THREADS>(
+              epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
+              select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx, qo_head_idx, qo_indptr,
+              qo_len, group_size_fastdiv);
+        } else {
+          write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O,
+                                    epilogue_params.layout_O, select<0, 1>(TileShape_PDV{}), sO,
+                                    thread_idx, qo_tile_idx, qo_head_idx, qo_indptr, qo_len,
+                                    write_warp_idx);
+        }
       }
     } else {
       // Non-rank-0 CTAs: wait for rank 0 to finish reduction, then return
@@ -621,10 +709,17 @@ struct CollectiveEpilogue {
                                             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         }
         TiledCopyO gmem_tiled_copy_O;
-        write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O,
-                                  epilogue_params.layout_O, select<0, 1>(TileShape_PDV{}), sO,
-                                  thread_idx, qo_tile_idx, qo_head_idx, qo_indptr, qo_len,
-                                  write_warp_idx);
+        if constexpr (PACK_GQA) {
+          write_tiled_packed<NUM_COPY_THREADS>(
+              epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
+              select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx, qo_head_idx, qo_indptr,
+              qo_len, group_size_fastdiv);
+        } else {
+          write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O,
+                                    epilogue_params.layout_O, select<0, 1>(TileShape_PDV{}), sO,
+                                    thread_idx, qo_tile_idx, qo_head_idx, qo_indptr, qo_len,
+                                    write_warp_idx);
+        }
       }
     }
   }
@@ -636,9 +731,33 @@ struct CollectiveEpilogue {
   // Write 0 to output and -inf to LSE
   template <typename BlockCoord, typename SharedStorage>
   CUTLASS_DEVICE void store_zero(Params const& epilogue_params, SharedStorage& shared_storage,
-                                 int thread_idx, BlockCoord const& block_coord) {
+                                 int thread_idx, BlockCoord const& block_coord,
+                                 cutlass::FastDivmod group_size_fastdiv = cutlass::FastDivmod(1)) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
+    if constexpr (PACK_GQA) {
+      // Packed scatter: zero O rows and -inf LSE per (token, head) decode.
+      const int packed_len = qo_len * group_size_fastdiv.divisor;
+      const int64_t stride_n = stride<0>(epilogue_params.layout_O);
+      const int64_t stride_h = stride<2>(epilogue_params.layout_O);
+      Tensor mLSE_p =
+          make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
+      for (int row = thread_idx; row < CTA_Q; row += NUM_MMA_THREADS) {
+        int packed_idx = qo_tile_idx * CTA_Q + row;
+        if (packed_idx >= packed_len) break;
+        auto coord = unpack_qo_row(packed_idx, group_size_fastdiv);
+        DTypeO* row_ptr = epilogue_params.O_ptr +
+                          (int64_t(qo_indptr) + coord.token) * stride_n +
+                          int64_t(qo_head_idx + coord.head_offset) * stride_h;
+        for (int col = 0; col < HEAD_DIM_VO; ++col) {
+          row_ptr[col] = DTypeO(0.f);
+        }
+        if (epilogue_params.lse_ptr) {
+          mLSE_p(qo_head_idx + coord.head_offset, qo_indptr + coord.token) = -math::inf;
+        }
+      }
+      return;
+    }
     Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.O_ptr), epilogue_params.layout_O);
     Tensor gO = get_local_tile_tensor(mO, select<0, 1>(TileShape_PDV{}), qo_head_idx, qo_indptr,
                                       qo_len)(_, _, qo_tile_idx);  // (O, D)

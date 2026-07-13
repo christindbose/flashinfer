@@ -1871,6 +1871,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise ValueError("pack_gqa does not support multi-item scoring")
             if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
                 raise ValueError("pack_gqa does not support FP8")
+            if mech2_mode:
+                raise ValueError("pack_gqa x mech2_mode is not supported yet")
 
         if self._cached_module is not None:
             # For SM90 backend (fa3/trtllm-gen), pass use_tree_walk_scheduling flag
