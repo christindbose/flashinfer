@@ -1543,6 +1543,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         use_tree_walk_scheduling: bool = False,
         kvsplit_mode: bool = False,
         mech2_mode: bool = False,
+        pack_gqa: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1859,6 +1860,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     ]
                     block_id += num_blocks_needed
 
+        if pack_gqa:
+            if self._backend not in ("fa3", "trtllm-gen"):
+                raise ValueError("pack_gqa is only supported on the SM90 (fa3) backend")
+            if num_qo_heads % num_kv_heads != 0:
+                raise ValueError("pack_gqa requires num_qo_heads % num_kv_heads == 0")
+            if window_left != -1:
+                raise ValueError("pack_gqa does not support sliding window yet")
+            if prefix_len_ptr is not None or token_pos_in_items_ptr is not None:
+                raise ValueError("pack_gqa does not support multi-item scoring")
+            if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise ValueError("pack_gqa does not support FP8")
+
         if self._cached_module is not None:
             # For SM90 backend (fa3/trtllm-gen), pass use_tree_walk_scheduling flag
             # Other backends will ignore it if not supported
@@ -1883,6 +1896,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         use_tree_walk_scheduling,
                         kvsplit_mode,
                         mech2_mode,
+                        pack_gqa,
                     )
                 else:
                     # For other backends, call without the flag

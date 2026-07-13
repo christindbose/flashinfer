@@ -69,6 +69,7 @@ struct RaggedParams {
   bool causal;
   bool kvsplit_mode = false;
   bool mech2_mode = false;
+  bool pack_gqa = false;  // KV-head-major grid; h_r QO heads packed into Q-tile rows
   uint8_t* cta_mech_mode = nullptr;  // per-CTA mech: 0 = mech1, 1 = mech2; null = use mech2_mode
   uint8_t* cta_valid_work = nullptr;  // per-CTA: 1 = valid work, 0 = not; null = assume all valid
   uint8_t* cta_is_dummy = nullptr;   // per-CTA: 1 = dummy for mech2 cluster padding, 0 = real
@@ -121,6 +122,7 @@ struct PagedParams {
   bool causal;
   bool kvsplit_mode = false;
   bool mech2_mode = false;
+  bool pack_gqa = false;  // KV-head-major grid; h_r QO heads packed into Q-tile rows
   uint8_t* cta_mech_mode = nullptr;  // per-CTA mech: 0 = mech1, 1 = mech2; null = use mech2_mode
   uint8_t* cta_valid_work = nullptr;  // per-CTA: 1 = valid work, 0 = not; null = assume all valid
   uint8_t* cta_is_dummy = nullptr;   // per-CTA: 1 = dummy for mech2 cluster padding, 0 = real
