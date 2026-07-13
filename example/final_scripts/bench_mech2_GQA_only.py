@@ -118,6 +118,7 @@ def benchmark_mech2_one_tree(
     bench_iters,
     verbose,
     kvsplit_mode=False,
+    pack_gqa=False,
 ):
     num_levels = len(nodes)
     batch_size = nodes[-1]
@@ -218,6 +219,7 @@ def benchmark_mech2_one_tree(
         use_tree_walk_scheduling=True,
         kvsplit_mode=kvsplit_mode,
         mech2_mode=False,
+        pack_gqa=pack_gqa,
     )
 
     for _ in range(warmup_iters):
@@ -306,6 +308,11 @@ def main():
         action="store_true",
         help="Activate mech1 KV splitting for items with kv_len >= 4096",
     )
+    parser.add_argument(
+        "--pack_gqa",
+        action="store_true",
+        help="KV-head-major grid: pack the GQA group's QO heads into Q-tile rows",
+    )
     args = parser.parse_args()
 
     if args.nodes is not None and args.contexts is not None:
@@ -364,6 +371,7 @@ def main():
                     bench_iters=args.bench_iters,
                     verbose=args.verbose,
                     kvsplit_mode=args.kvsplit_mode,
+                    pack_gqa=args.pack_gqa,
                 )
                 stats["tree_spec"] = label
                 stats["num_qo_heads"] = num_qo_heads

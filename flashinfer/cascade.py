@@ -420,6 +420,7 @@ class MultiLevelCascadeAttentionWrapper:
         use_tree_walk_scheduling: bool = False,
         kvsplit_mode: bool = False,
         mech2_mode: bool = False,
+        pack_gqa: bool = False,
     ):
         r"""Create auxiliary data structures for multi-level cascade attention for multiple
         forward calls within the same decode step. Please check
@@ -519,6 +520,7 @@ class MultiLevelCascadeAttentionWrapper:
                 use_tree_walk_scheduling=use_tree_walk_scheduling,
                 kvsplit_mode=kvsplit_mode,
                 mech2_mode=mech2_mode,
+                pack_gqa=pack_gqa,
             )
     
 
