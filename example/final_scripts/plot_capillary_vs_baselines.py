@@ -30,6 +30,7 @@ APRIL_CSV = Path(
 OURS_CSVS = {
     "kvsplit c2": SCRIPT_DIR / "bench_mech2_gqa_sweep_kvsplit_cluster2.csv",
     "kvsplit c4": SCRIPT_DIR / "bench_mech2_gqa_sweep_kvsplit_cluster4.csv",
+    "kvsplit c8": SCRIPT_DIR / "bench_mech2_gqa_sweep_kvsplit_cluster8.csv",
     "pack_gqa": SCRIPT_DIR / "bench_pack_on.csv",
     "kvsplit c2 + pack": SCRIPT_DIR / "bench_pack_kvsplit_cluster2.csv",
     "kvsplit c4 + pack": SCRIPT_DIR / "bench_pack_kvsplit_cluster4.csv",
@@ -47,6 +48,7 @@ BASELINES = [
 OURS = [
     ("kvsplit c2", "#eb6834"),
     ("kvsplit c4", "#eda100"),
+    ("kvsplit c8", "#8c564b"),
     ("pack_gqa", "#008300"),
     ("kvsplit c2 + pack", "#e87ba4"),
     ("kvsplit c4 + pack", "#4a3aa7"),
