@@ -31,12 +31,11 @@ CLUSTERS = [2, 4, 8]
 SERIES = (
     [(f"kvsplit c{c}", f"bench_mech2_gqa_sweep_kvsplit_cluster{c}.csv",
       "bench_pack_off.csv") for c in CLUSTERS]
-    + [
-        ("pack_gqa", "bench_pack_on.csv", "bench_pack_off.csv"),
-        ("kvsplit c4 + pack", "bench_pack_kvsplit_cluster4.csv", "bench_pack_off.csv"),
-    ]
+    + [("pack_gqa", "bench_pack_on.csv", "bench_pack_off.csv")]
+    + [(f"kvsplit c{c} + pack", f"bench_pack_kvsplit_cluster{c}.csv",
+        "bench_pack_off.csv") for c in CLUSTERS]
 )
-COLORS = ["#2a78d6", "#1baf7a", "#eda100", "#008300", "#4a3aa7"]
+COLORS = ["#2a78d6", "#1baf7a", "#eda100", "#008300", "#4a3aa7", "#e34948", "#e87ba4"]
 PANELS = [(32, 32), (32, 8), (16, 8)]  # (num_qo_heads, num_kv_heads), top -> bottom
 
 
@@ -65,7 +64,7 @@ def main():
     n_series = len(data)
     width = 0.8 / n_series
 
-    fig, axes = plt.subplots(len(PANELS), 1, figsize=(13.5, 7.6), sharex=True)
+    fig, axes = plt.subplots(len(PANELS), 1, figsize=(16.5, 8.2), sharex=True)
 
     y_max = 1.05 * max(base[(qo, kv, t)] / on[(qo, kv, t)]
                        for qo, kv in PANELS for t in trees for _, on, base in data)
@@ -84,7 +83,7 @@ def main():
                     xycoords="axes fraction", ha="right", va="top",
                     fontsize=9, color="#333333")
 
-    axes[0].legend(fontsize=9, frameon=False, loc="upper left", ncol=5)
+    axes[0].legend(fontsize=9, frameon=False, loc="upper left", ncol=7)
     axes[1].set_ylabel("speedup over baseline (no split, no pack)")
     axes[-1].set_xticks(x)
     axes[-1].set_xticklabels(trees, rotation=60, ha="right", fontsize=7.5)
