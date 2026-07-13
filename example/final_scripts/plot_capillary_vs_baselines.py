@@ -26,7 +26,13 @@ OUT_DIR = SCRIPT_DIR / "final_plots"
 APRIL_CSV = Path(
     "/home/chris241/myflashinfer_old/flashinfer/results/normalized_vs_pat_combined.csv"
 )
-OURS_CSV = OUT_DIR / "kvsplit_cluster_tree_bars.csv"
+# Each capillary variant reads its own sweep CSV (geo_mean_ms per config).
+OURS_CSVS = {
+    "kvsplit c4": SCRIPT_DIR / "bench_mech2_gqa_sweep_kvsplit_cluster4.csv",
+    "pack_gqa": SCRIPT_DIR / "bench_pack_on.csv",
+    "kvsplit c2 + pack": SCRIPT_DIR / "bench_pack_kvsplit_cluster2.csv",
+    "kvsplit c4 + pack": SCRIPT_DIR / "bench_pack_kvsplit_cluster4.csv",
+}
 
 PANELS = [(32, 32), (32, 8), (16, 8)]
 
@@ -39,6 +45,7 @@ BASELINES = [
 OURS = [
     ("kvsplit c4", "#eda100"),
     ("pack_gqa", "#008300"),
+    ("kvsplit c2 + pack", "#e87ba4"),
     ("kvsplit c4 + pack", "#4a3aa7"),
 ]
 APRIL_COL = {"FastTree": "FastTree_ms", "FlashAttention3": "fa_ms", "Cascade": "cascade_ms"}
@@ -54,12 +61,12 @@ def load_april():
 
 
 def load_ours():
-    out = {}
-    with open(OURS_CSV) as f:
-        for r in csv.DictReader(f):
-            key = (int(r["num_qo_heads"]), int(r["num_kv_heads"]), r["tree_spec"]
-                   if "tree_spec" in r else r["tree"])
-            out[key] = r
+    out = {}  # (qo, kv, tree) -> {label: ms}
+    for label, path in OURS_CSVS.items():
+        with open(path) as f:
+            for r in csv.DictReader(f):
+                key = (int(r["num_qo_heads"]), int(r["num_kv_heads"]), r["tree_spec"])
+                out.setdefault(key, {})[f"{label}_ms"] = r["geo_mean_ms"]
     return out
 
 
